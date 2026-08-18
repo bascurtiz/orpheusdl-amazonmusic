@@ -4,15 +4,11 @@ import functools
 import logging
 import os
 import itertools
-import pprint
-import random
 import re
-import shutil
 import subprocess
 import sys
 import typing
 import dataclasses
-import itertools
 import httpx
 from datetime import datetime, timedelta
 import concurrent.futures
@@ -24,8 +20,6 @@ import natsort
 from pywidevine import PSSH, Cdm, Device
 from pywidevine.license_protocol_pb2 import WidevinePsshData
 from Crypto.Cipher import AES
-
-from tqdm import tqdm
 from xml.etree import ElementTree
 
 from utils.models import *
@@ -47,9 +41,8 @@ LOGGER = logging.getLogger(__name__)
 
 # Album/playlist search: probe a few tracks per row (not every track) for acceptable speed.
 SEARCH_QUALITY_MAX_TRACK_PROBE = 3
-# Search rows always probe up to these tiers (independent of the user's download quality).
+# Search rows always probe up to this tier (independent of the user's download quality).
 SEARCH_PROBE_STEREO_TIER = QualityEnum.HIFI
-SEARCH_PROBE_SPATIAL_TIER = QualityEnum.ATMOS
 
 SHAKA_PACKAGER_HELP_URL = "https://github.com/shaka-project/shaka-packager/releases/latest"
 
@@ -102,33 +95,25 @@ class PSSHEntitlements:
     sonic: typing.Optional[PSSH] = None
     """ Apart of Prime Music (SD)"""
 
-    def to_dict(self):
-        return dataclasses.asdict(self)
-    
     def iterate(self):
-        for name, item in (
-            (field.name, getattr(self, field.name))
-            for field in dataclasses.fields(self)
-        ):
-            if not isinstance(item, PSSH):
-                continue
-            yield (name, item)
-    
+        for field in dataclasses.fields(self):
+            item = getattr(self, field.name)
+            if isinstance(item, PSSH):
+                yield field.name, item
+
     def _get_entitlements_group_id(self):
         # me when the method i want to use is literally a pain to implement:
-        for n, entitlement in self.iterate():
-            if not isinstance(entitlement, PSSH):
-                continue
+        for _name, entitlement in self.iterate():
             pssh = WidevinePsshData()
             pssh.ParseFromString(entitlement.init_data)
             yield pssh.group_ids[0].decode()
-    
+
     @property
     def music_territory(self):
         group_id = next(self._get_entitlements_group_id(), None)
         if not group_id:
             return
-        
+
         return group_id[-2:]
 
     @property
@@ -136,7 +121,7 @@ class PSSHEntitlements:
         for group_id in self._get_entitlements_group_id():
             if not group_id:
                 continue
-            
+
             yield group_id.split(":", maxsplit=1)[0]
 
 @dataclasses.dataclass(slots=True)
@@ -149,16 +134,11 @@ class AudioTrack:
     url: str
     official_quality_name: str
     quality: str
-    quality_ranking: int
     entitlements: PSSHEntitlements
     web_pssh: PSSH
-    # pssh: typing.Any
     reference_loudness: Optional[str] = None
     """ e.g 7.2 LUFS, some manifests don't include it """
     bit_depth: Optional[int] = None
-
-    def to_dict(self):
-        return dataclasses.asdict(self)
 
 
 # This is a Amazon Music module for OrpheusDL, requires an active account (optionally requires a active paid subscription)
@@ -249,6 +229,7 @@ class ModuleInterface:
         self.tsc = module_controller.temporary_settings_controller
         self._quality_notice_seen: set[str] = set()
         self._quality_notice_lock = threading.Lock()
+        self._preview_audio_cache: dict[str, str] = {}
 
         # Items highest are iterated first
         self.quality_parse = {
@@ -274,20 +255,12 @@ class ModuleInterface:
                 "SPATIAL_ATMOS",
             ],
         }
-        
+
         self.tier_parse = {
             AmazonMusicTier.FREE: QualityEnum.MINIMUM,
             AmazonMusicTier.PRIME: QualityEnum.HIGH,
             AmazonMusicTier.UNLIMITED: QualityEnum.HIFI,
         }
-
-        # if not module_controller.orpheus_options.disable_subscription_check and (
-        #     self.quality_parse[module_controller.orpheus_options.quality_tier]
-        #     > self.mobile_session.get_user_tier()
-        # ):
-        #     print(
-        #         "Example: quality set in the settings is not accessible by the current subscription"
-        #     )
 
         wvd_path = _validate_wvd_path(self.settings.get("wvd_path"))
         self.settings["wvd_path"] = wvd_path
@@ -327,7 +300,7 @@ class ModuleInterface:
         self.update_cached_credentials(mobile_session.credentials)
 
         return mobile_session
-    
+
     def update_cached_credentials(self, credentials: AmazonMusicMobileAPICredentials, remove_arg_credentials: typing.Optional[bool] = False):
         cached_creds = self.tsc.read("credentials") or {}
         # Add support for previous versions of this module
@@ -346,18 +319,12 @@ class ModuleInterface:
             final_creds = cached_creds
         else:
             final_creds = cached_creds | {
-                credentials.account_region.country: 
+                credentials.account_region.country:
                 credentials.to_dict()
             }
-        return self._save_credentials_to_tsc(final_creds)
-    
-    def _save_credentials_to_tsc(self, credentials: dict):
         # Save credentials to loginstorage.bin
-        try: 
-            self.tsc.set(
-                "credentials",
-                credentials
-            )
+        try:
+            self.tsc.set("credentials", final_creds)
         except Exception:
             return False
         return True
@@ -402,8 +369,6 @@ class ModuleInterface:
         cached_creds = self.tsc.read("credentials") or {}
         if not cached_creds:
             return
-        # for debug
-        # pprint.pprint(cached_creds)
 
         if selected_region and selected_region.country not in cached_creds and use_exact_region:
             return
@@ -429,7 +394,7 @@ class ModuleInterface:
             return True
 
         mobile_session = AmazonMusicMobileAPI(credentials=credentials)
-        
+
         if mobile_session.credentials.access_token_expired:
             try:
                 mobile_session.refresh_access_token()
@@ -440,7 +405,7 @@ class ModuleInterface:
                     f"This account (name: {mobile_session.credentials.customer_info.get('name', 'Unknown user')}, "
                     f"country: {mobile_session.credentials.account_region.pretty_name}) "
                     f"device session/account may be deleted.")
-                
+
                 if self.settings["prefer_removal_of_device_when_revoked"] is True:
                     self.update_cached_credentials(credentials, remove_arg_credentials=True)
                     self.print(f"{module_information.service_name}: Deleted from cache as per your settings.")
@@ -467,11 +432,9 @@ class ModuleInterface:
 
         LOGGER.debug(mobile_session.credentials)
         LOGGER.debug(mobile_session.get_account_subscription_tier())
-        # print(pprint.pformat(mobile_session.retrieve_customer_home()))
-        # print(pprint.pformat(mobile_session.get_account_status()))
 
         return mobile_session
-    
+
     def select_usable_region_from_regions(self, regions: typing.Iterable[AmazonRegion]):
         if not regions:
             return
@@ -483,12 +446,12 @@ class ModuleInterface:
                 continue
             return region
         return
-    
+
     @functools.lru_cache
     def select_session(self, selected_region: AmazonRegion):
         # select by country
         session = self.load_cached_mobile_session(selected_region, use_exact_region=True)
-        
+
         if not session:
             # select by continent (NA, EU, FE)
             continents = [selected_region.region] + [item for item in AmazonContinent if selected_region.region != item]
@@ -507,12 +470,12 @@ class ModuleInterface:
                     f"for the region {selected_region.pretty_name!r} "
                     f"(you are not logged into that region directly).\n"
                 )
-                
+
                 selected_region = new_region
                 break
         if not isinstance(session, AmazonMusicMobileAPI):
             raise ValueError("No accounts logged in!")
-        
+
         entitlement_usage = (
             self.settings['use_own_master_keys']
             and any(
@@ -531,7 +494,7 @@ class ModuleInterface:
     def custom_url_parse(self, link: str) -> MediaIdentification:
         url = urlparse(link)
         queries = parse_qs(url.query)
-        
+
         music_territory_name = next(iter(queries.get("musicTerritory", [])), None)
         music_territory = None
         if music_territory_name:
@@ -540,11 +503,6 @@ class ModuleInterface:
             music_territory = AmazonRegion.get_available_regions_by_continent(self.settings["prefer_account_continent"])[0]
         mobile_session, _ = self.select_session(music_territory)
 
-        # if not (url.netloc.endswith(mobile_session.credentials.tld)) and not self.settings["use_own_master_keys"]:
-        #     raise ValueError(
-        #         f"You must provide a URL that is within the same region as the account!"
-        #     )
-        
         if track_item := queries.get("trackAsin"):
             return MediaIdentification(
                 DownloadTypeEnum.track,
@@ -572,23 +530,70 @@ class ModuleInterface:
         ]
 
         if len(components) > 2:
-            return MediaIdentification(
-                media_type=type_matches[-1],
-                media_id=components[1]
+            media_id = (
+                components[1]
                 if type_matches[-1] is DownloadTypeEnum.artist
-                else components[2],  # my/playlists/uuid
-                extra_kwargs={
-                    "media_region": music_territory
-                }
+                else components[2]  # my/playlists/uuid
             )
         else:
-            return MediaIdentification(
-                media_type=type_matches[-1],
-                media_id=components[-1],
-                extra_kwargs={
-                    "media_region": music_territory
-                }
-            )
+            media_id = components[-1]
+
+        return MediaIdentification(
+            media_type=type_matches[-1],
+            media_id=media_id,
+            extra_kwargs={"media_region": music_territory},
+        )
+
+    def _cached_or_fetch(self, data: dict, key: str, fetch: typing.Callable[[], typing.Any]):
+        """Value from the orpheus data cache when present, else evaluate fetch()."""
+        if data and key in data:
+            return data[key]
+        return fetch()
+
+    def _mpd_quality_map(self, mobile_session: AmazonMusicMobileAPI, media_region: AmazonRegion, manifest, track_asin: str):
+        return self.mpd_to_quality_map(
+            manifest,
+            track_asin,
+            mobile_session.credentials.tier,
+            media_region,
+            mobile_session.credentials.account_region,
+        )
+
+    @staticmethod
+    def _valid_album_asins(album_data: dict, album_id: str, include_tracks: bool = False) -> list[str]:
+        """Every ASIN that can identify the album (API may answer with a substituted one)."""
+        asins = [album_id]
+        for key in ("requestedAsin", "globalAsin"):
+            if asin := album_data.get(key):
+                asins.append(asin)
+        if include_tracks:
+            asins.extend(track["asin"] for track in album_data.get("tracks", []))
+        return asins
+
+    def _resolve_album_cover(
+        self,
+        album_data: dict,
+        asins: typing.Iterable[str],
+        query: str,
+        mobile_session: AmazonMusicMobileAPI,
+        media_region: AmazonRegion,
+        cover_options: CoverOptions,
+        search_data: typing.Optional[dict] = None,
+    ):
+        """Hi-res cover (formatted for cover_options) via text search, else the default 600x600 art."""
+        cover_url, search_data = self.get_hi_res_cover(
+            asins=asins,
+            query=query,
+            search_data=search_data,
+            mobile_session=mobile_session,
+            media_region=media_region,
+        )
+        if not cover_url:
+            # Default 600 x 600 cover art
+            cover_url = str(album_data.get("image", ""))
+        else:
+            cover_url = self.format_cover_url(cover_url, cover_options)
+        return cover_url, search_data
 
     def get_track_info(
         self,
@@ -618,23 +623,14 @@ class ModuleInterface:
             if not mapped_audio_tracks:
                 asin, mpd = mobile_session.get_track_manifest(
                     track_asin=track_id,
-                    force_3d=any(
-                        not self.settings["force_non_spatial"] or self.settings[key]
-                        for key in ("prefer_spatial_mha1", "prefer_spatial_ac4")
-                    ),
+                    force_3d=self._amazon_force_3d_for_manifest(),
                     region_to_use=media_region
                 )
                 if not (asin and mpd):
                     raise RuntimeError(
                         f"Failed to obtain track manifest for {track_id}"
                     )
-                mapped_audio_tracks = self.mpd_to_quality_map(
-                    mpd,
-                    asin,
-                    mobile_session.credentials.tier,
-                    media_region,
-                    mobile_session.credentials.account_region
-                )
+                mapped_audio_tracks = self._mpd_quality_map(mobile_session, media_region, mpd, asin)
 
             effective_tier = (
                 QualityEnum(min(quality_tier.value, self.tier_parse[mobile_session.credentials.tier].value))
@@ -648,45 +644,32 @@ class ModuleInterface:
                 to_print=True,
             )
 
-            track_data = (
-                data[track_id]
-                if data and track_id in data
-                else mobile_session.get_track_info(track_id, region_to_use=media_region) # music_territory="CA"
+            track_data = self._cached_or_fetch(
+                data, track_id,
+                lambda: mobile_session.get_info(track_id, "trackList", region_to_use=media_region),
             )
             album_id = str(track_data["album"]["asin"])
-            album_data = (
-                data[album_id]
-                if data and album_id in data
-                else mobile_session.get_album_info(album_id, region_to_use=media_region) # music_territory="NZ"
+            album_data = self._cached_or_fetch(
+                data, album_id,
+                lambda: mobile_session.get_info(album_id, "albumList", region_to_use=media_region),
             )
             album_id = str(album_data["asin"])
-            
-            # if playlist_track_metadata := data.get(f"{track_id}_playlist"):
-            #     import pprint
-            #     pprint.pprint(playlist_track_metadata)
 
             # NOTE: I *could* use catalog_track AND catalog album
             # but I prefer to limit the amount of API Requests per track
-            search_data = (
-                data[f"{album_id}_search"]
-                if data and f"{album_id}_search" in data
-                else mobile_session.search(
+            search_data = self._cached_or_fetch(
+                data, f"{album_id}_search",
+                lambda: mobile_session.search(
                     query='"{}", "{}"'.format(
                         album_data["artist"]["name"],
                         album_data["title"],
-                        # track_data["title"],
                     ),
                     asins=(album_id, track_id, str(track_data["globalAsin"])),
                     search_types=("catalog_album",),
                     region_to_use=media_region
                 )
-                or {}
+                or {},
             )
-            # page_entity_data = (
-            #     dict(data[f"{album_id}_page_entity_data"])
-            #     if data and f"{album_id}_page_entity_data" in data
-            #     else mobile_session.get_page(f"album/{album_id}", count=0, locale="en_US").get("entity", {})
-            # )
 
             release_datetime = self._get_date_from_metadata(album_data)
 
@@ -717,18 +700,14 @@ class ModuleInterface:
                     if artist in artists:
                         artists.remove(artist)
                     for new_art in sep_artists:
-                        if not primary_artist_name:
-                            continue
-                        if (
-                            (
-                                new_art in primary_artist_name
-                                or
-                                primary_artist_name in new_art
-                            ) and
+                        # Fails here when an artist thats split isn't supposed to be split
+                        if not primary_artist_name or (
                             new_art != primary_artist_name
+                            and (
+                                new_art in primary_artist_name
+                                or primary_artist_name in new_art
+                            )
                         ):
-                            # Fails here when an artist thats split
-                            # isn't supposed to be split
                             continue
                         artists.append(new_art)
 
@@ -821,28 +800,16 @@ class ModuleInterface:
                 extra_tags=extra_tags,
             )
 
-            valid_album_asins = [album_id]
-            
-            if asin := album_data.get("requestedAsin"):
-                valid_album_asins.append(asin)
-            if asin := album_data.get("globalAsin"):
-                valid_album_asins.append(asin)
-
-            cover_url, search_data = self.get_hi_res_cover(
-                asins=valid_album_asins,
-                query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
+            cover_url, search_data = self._resolve_album_cover(
+                album_data,
+                self._valid_album_asins(album_data, album_id),
+                f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
+                mobile_session,
+                media_region,
+                self.options.default_cover_options,
                 search_data=search_data,
-                mobile_session=mobile_session,
-                media_region=media_region
             )
-            if not cover_url:
-                # Default 600 x 600 cover art
-                cover_url = str(album_data.get("image", ""))
-            else:
-                cover_url = self.format_cover_url(
-                    cover_url, self.options.default_cover_options
-                )
-            
+
             return TrackInfo(
                 name=self.sanitize_parental_status_name(track_data["title"]),
                 album_id=f"{album_id}_{media_region.country}",
@@ -885,16 +852,17 @@ class ModuleInterface:
 
     def get_track_download(self, audio_track: AudioTrack, media_region: AmazonRegion, **kwargs):
         mobile_session, _ = self.select_session(media_region)
-        # print(audio_track)
         session_id = None
         try:
             os.makedirs("temp/", exist_ok=True)
             encrypted_track_location = f"{create_temp_filename()}.mp4"
 
-            self.download(
+            # OrpheusDL default downloader only (aria2c/aria2p not supported in this distribution)
+            download_file(
                 audio_track.url,
                 encrypted_track_location,
-                use_aria2c=self.settings["prefer_aria2c"],
+                enable_progress_bar=bool(self.module_controller.progress_bar_enabled),
+                indent_level=getattr(self.module_controller.printer_controller, "indent_number", 0),
             )
 
             decrypted_track_location = f"{create_temp_filename()}.mp4"  # {codec_data[audio_track.codec].container.name}
@@ -908,30 +876,24 @@ class ModuleInterface:
                 self.settings["use_own_master_keys"]
                 and any(str(item).endswith(media_region.country) for item in self.settings["master_keys"])
             ):
-                while True:
-                    selected_pssh = None
-                    main_key: bytes = b""
-                    for name, entitle_pssh in audio_track.entitlements.to_dict().items():
-                        if not isinstance(entitle_pssh, PSSH):
-                            continue
-                        key_name = f"{name.upper()}:{audio_track.entitlements.music_territory}"
-                        if key_name not in self.settings["master_keys"]:
-                            continue
+                selected_pssh = None
+                main_key: bytes = b""
+                for name, entitle_pssh in audio_track.entitlements.iterate():
+                    key_name = f"{name.upper()}:{audio_track.entitlements.music_territory}"
+                    if key_name not in self.settings["master_keys"]:
+                        continue
 
-                        main_key = bytes.fromhex(self.settings["master_keys"][key_name])
-                        if main_key:
-                            selected_pssh = entitle_pssh
-                        break
-                    
-                    if not (main_key and selected_pssh):
-                        break
-                    
+                    main_key = bytes.fromhex(self.settings["master_keys"][key_name])
+                    if main_key:
+                        selected_pssh = entitle_pssh
+                    break
+
+                if main_key and selected_pssh:
                     key_id, key = self.get_decrypted_key(
                         enc_key=main_key,
                         pssh=selected_pssh,
                         enc_key_type="CONTENT",
                     )
-                    # print(f"using own entitlements {key_id=} {key=}")
                     self.call_shaka_packager(
                         encrypted_file=encrypted_track_location,
                         destination_file=decrypted_track_location,
@@ -939,25 +901,19 @@ class ModuleInterface:
                         key=key,
                         label=audio_track.official_quality_name
                     )
-                    break
-                    
+
             # Interact with the license server
             if not os.path.exists(decrypted_track_location) and mobile_session.credentials.tier is not AmazonMusicTier.FREE:
                 session_id = self.cdm.open()
-                # print(f"{audio_track.entitlements=} {audio_track.web_pssh=}")
-                
-                used_entitlement: dict[str, PSSH] | None = {}
-                for name, pssh_to_test in audio_track.entitlements.to_dict().items():
+
+                used_entitlement: dict[str, PSSH] = {}
+                for name, pssh_to_test in audio_track.entitlements.iterate():
                     if not self.cdm.system_id == 9780:
                         continue
                     if not pssh_to_test:
                         continue
                     if f"{name.upper()}_CONTENT" not in mobile_session.credentials.tier.internal_content_tiers and not self.options.disable_subscription_check:
                         continue
-                    
-                    # maybe?
-                    # if audio_track.entitlements.music_territory != mobile_session.credentials.account_region.country:
-                    #     continue
 
                     license_challenge = base64.b64encode(
                         self.cdm.get_license_challenge(
@@ -975,16 +931,13 @@ class ModuleInterface:
                         continue
                     else:
                         if not license_response:
-                            # license_response = input("License retrieval failed, enter response here (for testing): ")
                             continue
-                        # print(f"used entitle acq: {name}")
                         used_entitlement.update({
                             name: pssh_to_test
                         })
                         self.cdm.parse_license(session_id, license_response)
                         break
                 else:
-                    # print("reg")
                     license_challenge = base64.b64encode(
                         self.cdm.get_license_challenge(
                             session_id, audio_track.web_pssh, privacy_mode=False
@@ -999,21 +952,18 @@ class ModuleInterface:
 
                     self.cdm.parse_license(session_id, license_response)
 
-                # print(used_entitlement)
                 for key in self.cdm.get_keys(session_id):
                     if key.type == "ENTITLEMENT":
                         if not used_entitlement:
                             continue
 
                         name, used_pssh = used_entitlement.popitem()
-                        # name , used_pssh = used_entitlement[next(iter(used_entitlement))]
                         key_id, dec_key = self.get_decrypted_key(
                             key.key,
                             used_pssh,
                             "CONTENT"
                         )
                         key_name = f"{name.upper()}:{audio_track.entitlements.music_territory}"
-                        # if not self.settings["master_keys"].get("key_name"):
                         self.print(
                             f'{module_information.service_name}: New entitlement key '
                             f'found for {audio_track.entitlements.music_territory}! '
@@ -1025,9 +975,7 @@ class ModuleInterface:
                         dec_key = key.key.hex()
                     else:
                         continue
-                    # print(f"{key_id=} {dec_key=}")
-                    # continue
-                        
+
                     self.call_shaka_packager(
                         encrypted_file=encrypted_track_location,
                         destination_file=decrypted_track_location,
@@ -1052,13 +1000,10 @@ class ModuleInterface:
                     different_codec=audio_track.codec,
                 )
 
-            LOGGER.debug(
-                f"Using {selected_codec_data.container.name} as the container for {audio_track.codec.name}"
-            )
+            LOGGER.debug(f"Using {selected_codec_data.container.name} as the container for {audio_track.codec.name}")
             final_decrypted_track_location = (
                 f"{create_temp_filename()}.{selected_codec_data.container.name}"
             )
-            # return
             ffcmd: ffmpeg = ffmpeg.input(decrypted_track_location)  # type: ignore
             ffcmd_out_kwargs = {
                 "filename": final_decrypted_track_location,
@@ -1066,7 +1011,6 @@ class ModuleInterface:
                 "audio_bitrate": f"{audio_track.bitrate}k",
             }
             if self.settings["trim_track_by_sample_rate"]:
-                # self.print(f"Trimming out the first {int(int(audio_track.sample_rate) * 6.5)} samples")
                 ffcmd_out_kwargs.update(
                     {"af": f"atrim=start_sample={int(int(audio_track.sample_rate) * 6.5)}"}
                 )
@@ -1077,7 +1021,6 @@ class ModuleInterface:
                 raise RuntimeError(f"ffmpeg: {stderr}")
             silentremove(decrypted_track_location)
 
-
         finally:
             if session_id:
                 self.cdm.close(session_id)
@@ -1086,6 +1029,13 @@ class ModuleInterface:
             download_type=DownloadEnum.TEMP_FILE_PATH,
             temp_file_path=final_decrypted_track_location,
         )
+
+    def _preferred_account_region(self) -> AmazonRegion:
+        """A cached-login region from the preferred continent, else the first region of it."""
+        continents = AmazonRegion.get_available_regions_by_continent(
+            self.settings["prefer_account_continent"]
+        )
+        return self.select_usable_region_from_regions(continents) or continents[0]
 
     def get_preview_audio_path(
         self,
@@ -1107,22 +1057,10 @@ class ModuleInterface:
                 media_region = None
 
         if media_region is None:
-            continents = AmazonRegion.get_available_regions_by_continent(
-                self.settings["prefer_account_continent"]
-            )
-            media_region = (
-                self.select_usable_region_from_regions(continents)
-                or (continents[0] if continents else None)
-            )
-        if media_region is None:
-            return None
+            media_region = self._preferred_account_region()
 
         cache_key = f"{track_id}:{media_region.country}"
-        cache = getattr(self, "_preview_audio_cache", None)
-        if cache is None:
-            cache = {}
-            self._preview_audio_cache = cache
-        cached = cache.get(cache_key)
+        cached = self._preview_audio_cache.get(cache_key)
         if cached and os.path.isfile(cached):
             return cached
 
@@ -1135,13 +1073,7 @@ class ModuleInterface:
         if not (asin and mpd):
             return None
 
-        mapped_audio_tracks = self.mpd_to_quality_map(
-            mpd,
-            asin,
-            mobile_session.credentials.tier,
-            media_region,
-            mobile_session.credentials.account_region,
-        )
+        mapped_audio_tracks = self._mpd_quality_map(mobile_session, media_region, mpd, asin)
         preview_tier = QualityEnum.MINIMUM
         audio_track = self._get_usable_audio_track_of_mapped_quailty(
             mapped_audio_tracks=mapped_audio_tracks,
@@ -1168,19 +1100,6 @@ class ModuleInterface:
             cache[cache_key] = download_info.temp_file_path
             return download_info.temp_file_path
         return None
-
-    @staticmethod
-    def _metadata_artist_name(entity: dict) -> str:
-        """Artist display name from album/track metadata or text-search hits."""
-        if not entity:
-            return ""
-        artist = entity.get("artist")
-        if isinstance(artist, dict) and artist.get("name"):
-            return str(artist["name"])
-        for key in ("primaryArtistName", "artistName", "albumArtistName"):
-            if entity.get(key):
-                return str(entity[key])
-        return ""
 
     @staticmethod
     def _format_sample_rate_khz(sample_rate: typing.Any) -> str:
@@ -1214,17 +1133,6 @@ class ModuleInterface:
         )
 
     @staticmethod
-    def _spatial_quality_label(quality_tags: dict) -> str:
-        official = str(quality_tags.get("official_quality_name") or "").strip()
-        codec = str(quality_tags.get("codec_pretty_name") or "").strip()
-        parts: list[str] = []
-        if official:
-            parts.append(official)
-        if codec and codec not in parts:
-            parts.append(codec)
-        return " ".join(parts)
-
-    @staticmethod
     def _amazon_spatial_display_label(codec_name: str = "", official_name: str = "") -> str:
         """Canonical spatial labels for search UI (small-caps via gui._to_small_caps)."""
         combined = f"{official_name} {codec_name}".lower()
@@ -1236,13 +1144,14 @@ class ModuleInterface:
             return "◗◖ ATMOS"
         if (official_name or "").strip().upper() in ("3D", "ATMOS"):
             return "◗◖ ATMOS"
-        raw = ModuleInterface._spatial_quality_label(
-            {
-                "official_quality_name": official_name,
-                "codec_pretty_name": codec_name,
-            }
-        )
-        return raw or "◗◖ ATMOS"
+        official = str(official_name or "").strip()
+        codec = str(codec_name or "").strip()
+        parts: list[str] = []
+        if official:
+            parts.append(official)
+        if codec and codec not in parts:
+            parts.append(codec)
+        return " ".join(parts) or "◗◖ ATMOS"
 
     def _quality_label_from_mapped(
         self,
@@ -1276,18 +1185,6 @@ class ModuleInterface:
         return (0, 0.0, 0)
 
     @staticmethod
-    def _sample_track_asins_for_quality_probe(
-        track_asins: list[str], max_probe: int = SEARCH_QUALITY_MAX_TRACK_PROBE
-    ) -> tuple[str, ...]:
-        """First / middle / last track — enough to detect the album's highest tier."""
-        if not track_asins:
-            return ()
-        if len(track_asins) <= max_probe:
-            return tuple(track_asins)
-        indices = sorted({0, len(track_asins) // 2, len(track_asins) - 1})
-        return tuple(track_asins[i] for i in indices[:max_probe])
-
-    @staticmethod
     def _best_quality_display(displays: typing.Iterable[str]) -> str:
         """Highest available quality only (e.g. 44.1kHz/24bit, not 16bit + OPUS)."""
         labels = [str(d).strip() for d in displays if d and str(d).strip()]
@@ -1312,15 +1209,11 @@ class ModuleInterface:
             best = tracks[0]
             tier_key = str(best.quality or best.official_quality_name or "")
             is_spatial = self._is_spatial_audio_track(best)
+            seen = seen_spatial if is_spatial else seen_stereo
+            if tier_key in seen:
+                continue
+            seen.add(tier_key)
             if is_spatial:
-                if tier_key in seen_spatial:
-                    continue
-                seen_spatial.add(tier_key)
-            else:
-                if tier_key in seen_stereo:
-                    continue
-                seen_stereo.add(tier_key)
-            if is_spatial or self._is_spatial_audio_track(best):
                 label = self._spatial_manifest_badge(best)
                 if not label:
                     continue
@@ -1348,25 +1241,28 @@ class ModuleInterface:
             for key in ("prefer_spatial_mha1", "prefer_spatial_ac4")
         )
 
-    def _probe_manifest_quality_label_sets(
+    def _probe_manifests_for_quality(
         self,
         mobile_session: AmazonMusicMobileAPI,
         track_asins: tuple[str, ...],
         media_region: AmazonRegion,
         *,
         force_3d: bool,
-        per_track_stereo_label: bool = False,
-    ) -> tuple[set[str], set[str]]:
+    ) -> tuple[set[str], set[str], set[str], bool]:
         """
         Discover tiers in the manifest for the given force_3d mode.
 
         Amazon's try3dAsinSubstitution (force_3d=True) exposes Atmos but often drops UHD;
         force_3d=False is required for 192 kHz / stereo tiers (see azapi.get_tracks_manifest).
+
+        Returns (spatial_labels, stereo_labels, per_track_labels, has_ra360_manifest).
         """
         spatial_labels: set[str] = set()
         stereo_labels: set[str] = set()
+        per_track_labels: set[str] = set()
+        has_ra360_manifest = False
         if not track_asins:
-            return spatial_labels, stereo_labels
+            return spatial_labels, stereo_labels, per_track_labels, has_ra360_manifest
         for track_asin, manifest in mobile_session.get_tracks_manifest(
             track_asins,
             force_3d=force_3d,
@@ -1375,106 +1271,18 @@ class ModuleInterface:
             if manifest is None:
                 continue
             try:
-                mapped = self.mpd_to_quality_map(
-                    manifest,
-                    track_asin,
-                    mobile_session.credentials.tier,
-                    media_region,
-                    mobile_session.credentials.account_region,
-                )
+                mapped = self._mpd_quality_map(mobile_session, media_region, manifest, track_asin)
+                if self._mapped_has_spatial_prefix(mapped, "SPATIAL_RA360"):
+                    has_ra360_manifest = True
                 spatial, stereo = self._collect_manifest_quality_labels(mapped)
                 spatial_labels |= spatial
                 stereo_labels |= stereo
-                if per_track_stereo_label and not force_3d:
-                    per_track = self._quality_label_from_mapped(
-                        mapped, SEARCH_PROBE_STEREO_TIER
-                    )
-                    if per_track and not self._is_spatial_quality_display(
-                        per_track, per_track
-                    ):
-                        stereo_labels.add(per_track)
+                label = self._quality_label_from_mapped(mapped, SEARCH_PROBE_STEREO_TIER)
+                if label:
+                    per_track_labels.add(label)
             except Exception as ex:
-                LOGGER.debug(
-                    "Manifest quality collect failed for %s: %s", track_asin, ex
-                )
-        return spatial_labels, stereo_labels
-
-    def _probe_quality_labels(
-        self,
-        mobile_session: AmazonMusicMobileAPI,
-        track_asins: tuple[str, ...],
-        media_region: AmazonRegion,
-        force_3d: bool,
-        quality_tier: QualityEnum,
-    ) -> set[str]:
-        labels: set[str] = set()
-        if not track_asins:
-            return labels
-        for track_asin, manifest in mobile_session.get_tracks_manifest(
-            track_asins,
-            force_3d=force_3d,
-            region_to_use=media_region,
-        ):
-            if manifest is None:
-                continue
-            mapped = self.mpd_to_quality_map(
-                manifest,
-                track_asin,
-                mobile_session.credentials.tier,
-                media_region,
-                mobile_session.credentials.account_region,
-            )
-            label = self._quality_label_from_mapped(mapped, quality_tier)
-            if label:
-                labels.add(label)
-        return labels
-
-    @staticmethod
-    def _pick_spatial_display_label(labels: typing.Iterable[str]) -> typing.Optional[str]:
-        for label in labels:
-            text = str(label)
-            if ModuleInterface._is_spatial_quality_display(text, text):
-                return text
-        return None
-
-    @staticmethod
-    def _spatial_label_is_atmos(text: str) -> bool:
-        combined = str(text or "").lower()
-        return bool(
-            re.search(r"e-ac-3|ac-4|\batmos\b|joc|dolby|◗", combined)
-            and not re.search(r"mpeg-h|mha1|mhm1|\bra360\b", combined)
-        )
-
-    @staticmethod
-    def _spatial_label_is_ra360(text: str) -> bool:
-        combined = str(text or "").lower()
-        if "3d mpeg-h" in combined or "spatial_ra360" in combined:
-            return True
-        return bool(
-            re.search(r"mpeg-h|mha1|mhm1", combined)
-            and not re.search(r"e-ac-3|ac-4|\batmos\b|joc|dolby|◗", combined)
-        )
-
-    @staticmethod
-    def _spatial_display_tokens(spatial_labels: typing.Iterable[str]) -> list[str]:
-        """Distinct spatial badges (Atmos and Sony 360RA are separate tiers)."""
-        has_atmos = False
-        has_ra360 = False
-        for label in spatial_labels or []:
-            text = str(label).strip()
-            if not text:
-                continue
-            display = ModuleInterface._amazon_manifest_label_for_display(text)
-            if ModuleInterface._spatial_label_is_atmos(text) or display == "◗◖ ATMOS":
-                has_atmos = True
-            if ModuleInterface._spatial_label_is_ra360(text) or display == "3D MPEG-H Audio":
-                has_ra360 = True
-        tokens: list[str] = []
-        if has_atmos:
-            tokens.append("◗◖ ATMOS")
-        if has_ra360:
-            tokens.append("3D MPEG-H Audio")
-        return tokens
+                LOGGER.debug("Manifest quality probe failed for %s: %s", track_asin, ex)
+        return spatial_labels, stereo_labels, per_track_labels, has_ra360_manifest
 
     def _merge_manifest_quality_labels(
         self,
@@ -1491,10 +1299,31 @@ class ModuleInterface:
             and str(label).strip()
             and not self._is_spatial_quality_display(str(label), str(label))
         }
-        if spatial_set:
-            for spatial_display in self._spatial_display_tokens(spatial_set):
-                if spatial_display and spatial_display not in result:
-                    result.append(spatial_display)
+        # Distinct spatial badges (Atmos and Sony 360RA are separate tiers).
+        has_atmos = False
+        has_ra360 = False
+        for label in spatial_set:
+            low = label.lower()
+            display = self._amazon_manifest_label_for_display(label)
+            if (
+                re.search(r"e-ac-3|ac-4|\batmos\b|joc|dolby|◗", low)
+                and not re.search(r"mpeg-h|mha1|mhm1|\bra360\b", low)
+            ) or display == "◗◖ ATMOS":
+                has_atmos = True
+            if (
+                "3d mpeg-h" in low
+                or "spatial_ra360" in low
+                or (
+                    re.search(r"mpeg-h|mha1|mhm1", low)
+                    and not re.search(r"e-ac-3|ac-4|\batmos\b|joc|dolby|◗", low)
+                )
+                or display == "3D MPEG-H Audio"
+            ):
+                has_ra360 = True
+        if has_atmos:
+            result.append("◗◖ ATMOS")
+        if has_ra360:
+            result.append("3D MPEG-H Audio")
         if stereo_set:
             best_stereo = self._best_quality_display(stereo_set)
             if best_stereo:
@@ -1502,16 +1331,6 @@ class ModuleInterface:
                 if stereo_display and stereo_display not in result:
                     result.append(stereo_display)
         return result
-
-    @staticmethod
-    def _strip_legacy_bit_khz_suffix(text: str) -> str:
-        """Remove template artifacts like 'bit-48kHz' left when bit_depth is empty."""
-        return re.sub(
-            r"\s*bit-?\s*\d+(?:\.\d+)?\s*khz\s*",
-            "",
-            text,
-            flags=re.IGNORECASE,
-        ).strip()
 
     @staticmethod
     def _format_quality_display(quality_tags: dict, quality_format: str) -> str:
@@ -1544,7 +1363,13 @@ class ModuleInterface:
             out = f"{official_name} {fmt['codec_pretty_name']}".strip()
         if re.search(r"\bopus\b", out, re.I) and re.search(r"none\s*bit|nonebit", out, re.I):
             return "OPUS only"
-        return ModuleInterface._strip_legacy_bit_khz_suffix(out)
+        # Remove template artifacts like 'bit-48kHz' left when bit_depth is empty.
+        return re.sub(
+            r"\s*bit-?\s*\d+(?:\.\d+)?\s*khz\s*",
+            "",
+            out,
+            flags=re.IGNORECASE,
+        ).strip()
 
     @staticmethod
     def _quality_labels_from_entity(entity: dict) -> list[str]:
@@ -1590,22 +1415,23 @@ class ModuleInterface:
 
         enc = entity.get("contentEncoding")
         if isinstance(enc, dict):
-            for key, val in enc.items():
-                if val in (False, 0, None, "", "false", "False"):
-                    continue
-                _add(_label_for_key(str(key)) or str(key))
+            encoding_items = [(str(key), val) for key, val in enc.items()]
         elif isinstance(enc, list):
-            for item in enc:
-                if isinstance(item, dict):
-                    key = str(item.get("type") or item.get("name") or item.get("encoding") or "")
-                    if item.get("value") in (False, 0, None, "", "false", "False"):
-                        continue
-                    _add(_label_for_key(key) or str(key))
-                elif isinstance(item, str):
-                    try:
-                        _add(encoding_labels[item])
-                    except KeyError:
-                        _add(_label_for_key(item) or item)
+            encoding_items = [
+                (
+                    str(item.get("type") or item.get("name") or item.get("encoding") or ""),
+                    item.get("value"),
+                )
+                if isinstance(item, dict)
+                else (str(item), True)
+                for item in enc
+            ]
+        else:
+            encoding_items = []
+        for key, val in encoding_items:
+            if val in (False, 0, None, "", "false", "False"):
+                continue
+            _add(_label_for_key(key) or key)
 
         for flag_key, label in (
             ("uhdAvailable", "UHD"),
@@ -1623,30 +1449,6 @@ class ModuleInterface:
         return natsort.natsorted(tags, key=len)
 
     @staticmethod
-    def _parse_khz_bit_display_label(label: str) -> typing.Optional[tuple[float, int]]:
-        m = re.search(
-            r"(\d+(?:\.\d+)?)\s*kHz\s*/\s*(\d+)\s*bit",
-            str(label or ""),
-            re.IGNORECASE,
-        )
-        if not m:
-            return None
-        try:
-            return float(m.group(1)), int(m.group(2))
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _is_hi_res_lossless(sample_rate_khz: float, bit_depth: int) -> bool:
-        """Same rule as Apple Music / Qobuz search: hi-res only above 48 kHz at 24-bit+."""
-        return float(sample_rate_khz) > 48.0 and int(bit_depth) >= 24
-
-    @staticmethod
-    def _is_amazon_uhd_lossless(sample_rate_khz: float, bit_depth: int) -> bool:
-        """Amazon Ultra HD is commonly 48 kHz / 24-bit (catalog + MPD UHD tier)."""
-        return float(sample_rate_khz) >= 48.0 and int(bit_depth) >= 24
-
-    @staticmethod
     def _amazon_manifest_label_for_display(label: str) -> str:
         """MPD-derived label → ATMOS / kHz·bit / HI-RES / OPUS only (never catalog UHD flags)."""
         text = str(label or "").strip()
@@ -1658,15 +1460,16 @@ class ModuleInterface:
             return "OPUS only"
         if re.search(r"\b(?:uhd|ultra\s*hd)\b", text, re.IGNORECASE):
             return "🅷 HI-RES"
-        parsed = ModuleInterface._parse_khz_bit_display_label(text)
-        if parsed:
-            sr_khz, bit_depth = parsed
-            if (
-                ModuleInterface._is_hi_res_lossless(sr_khz, bit_depth)
-                or ModuleInterface._is_amazon_uhd_lossless(sr_khz, bit_depth)
-            ):
-                return "🅷 HI-RES"
-            return text
+        m = re.search(r"(\d+(?:\.\d+)?)\s*kHz\s*/\s*(\d+)\s*bit", text, re.IGNORECASE)
+        if m:
+            try:
+                sr_khz, bit_depth = float(m.group(1)), int(m.group(2))
+                # Hi-res is anything at/above 48 kHz with 24-bit+ (Apple/Qobuz hi-res rule
+                # is strictly above 48 kHz; Amazon Ultra HD is commonly 48 kHz / 24-bit).
+                if sr_khz >= 48.0 and bit_depth >= 24:
+                    return "🅷 HI-RES"
+            except (TypeError, ValueError):
+                pass
         return text
 
     @staticmethod
@@ -1812,39 +1615,24 @@ class ModuleInterface:
         if not track_asin:
             return []
         try:
-            spatial_labels, _ = self._probe_manifest_quality_label_sets(
+            spatial_labels, _, _, _ = self._probe_manifests_for_quality(
                 mobile_session,
                 (str(track_asin),),
                 media_region,
                 force_3d=True,
             )
-            _, stereo_labels = self._probe_manifest_quality_label_sets(
+            _, stereo_labels, per_track_labels, _ = self._probe_manifests_for_quality(
                 mobile_session,
                 (str(track_asin),),
                 media_region,
                 force_3d=False,
-                per_track_stereo_label=True,
             )
-            return self._merge_manifest_quality_labels(spatial_labels, stereo_labels)
+            return self._merge_manifest_quality_labels(
+                spatial_labels, stereo_labels | per_track_labels
+            )
         except Exception as ex:
             LOGGER.debug("Track search manifest quality probe failed for %s: %s", track_asin, ex)
             return []
-
-    @staticmethod
-    def _playlist_payload_is_complete(p_data: dict) -> bool:
-        """True when payload is a full playlist API response, not a text-search hit."""
-        if not p_data or not isinstance(p_data, dict):
-            return False
-        meta = p_data.get("metadata")
-        if not isinstance(meta, dict) or not meta.get("title"):
-            return False
-        tracks = p_data.get("tracks")
-        if not tracks or not isinstance(tracks, list):
-            return True
-        first = tracks[0]
-        if not isinstance(first, dict):
-            return False
-        return bool(first.get("metadata") or first.get("asin"))
 
     @staticmethod
     def _playlist_track_asin(track: dict) -> typing.Optional[str]:
@@ -1857,13 +1645,6 @@ class ModuleInterface:
             return str(track["asin"])
         return None
 
-    @staticmethod
-    def _playlist_track_metadata(track: dict) -> dict:
-        if not isinstance(track, dict):
-            return {}
-        meta = track.get("metadata")
-        return meta if isinstance(meta, dict) else track
-
     def get_album_info(self, album_id: str, media_region: typing.Optional[AmazonRegion] = None, data: dict = {}) -> Optional[AlbumInfo]:
         LOGGER.debug("Getting album info")
         if not media_region:
@@ -1871,10 +1652,10 @@ class ModuleInterface:
             if len(split_album_id[-1]) == 2:
                 media_region = AmazonRegion.get_region_by_country(split_album_id[-1])
                 album_id = split_album_id[0]
-                
+
         if not media_region:
             raise TypeError(f"Invalid selected media region for {album_id}")
-        
+
         mobile_session, _ = self.select_session(media_region)
 
         cached = data.get(album_id) if data and album_id in data else None
@@ -1883,25 +1664,31 @@ class ModuleInterface:
             album_data = dict(cached)
         else:
             album_data = dict(
-                mobile_session.get_album_info(
+                mobile_session.get_info(
                     album_id,
+                    "albumList",
                     use_alternative_naming=False,
                     region_to_use=media_region,
                 )
             )
         # Force use the ASIN the API returns with
         album_id = album_data["asin"]
-        
-        valid_asins = [album_id]
-        
-        if asin := album_data.get("requestedAsin"):
-            valid_asins.append(asin)
-        if asin := album_data.get("globalAsin"):
-            valid_asins.append(asin)
-        
-        valid_asins.extend((track["asin"] for track in album_data.get("tracks", [])))
 
-        artist_name = self._metadata_artist_name(album_data)
+        valid_asins = self._valid_album_asins(album_data, album_id, include_tracks=True)
+
+        # Artist display name from album/track metadata or text-search hits.
+        artist = album_data.get("artist")
+        if isinstance(artist, dict) and artist.get("name"):
+            artist_name = str(artist["name"])
+        else:
+            artist_name = next(
+                (
+                    str(album_data[key])
+                    for key in ("primaryArtistName", "artistName", "albumArtistName")
+                    if album_data.get(key)
+                ),
+                "",
+            )
         album_title = str(album_data.get("title") or "Unknown")
         cover_url, search_data = self.get_hi_res_cover(
             asins=valid_asins,
@@ -1918,17 +1705,11 @@ class ModuleInterface:
             cover_url, self.options.default_cover_options
         ) if cover_url else ""
 
-        # album_data = self.mobile_session.get_album_info(album_id, use_alternative_naming=True)
-        # pprint.pprint(mobile_session.get_page(f"album/{album_id}", region_to_use=media_region))
-
         mapped_tracks = {
-            f"{asin}_quality_mapping": self.mpd_to_quality_map(mpd, asin, mobile_session.credentials.tier, media_region, mobile_session.credentials.account_region)
+            f"{asin}_quality_mapping": self._mpd_quality_map(mobile_session, media_region, mpd, asin)
             for asin, mpd in mobile_session.get_tracks_manifest(
                 (track["asin"] for track in album_data.get("tracks", [])),
-                force_3d=any(
-                    not self.settings["force_non_spatial"] or self.settings[key]
-                    for key in ("prefer_spatial_mha1", "prefer_spatial_ac4")
-                ),
+                force_3d=self._amazon_force_3d_for_manifest(),
                 region_to_use=media_region
             )
             if mpd
@@ -1954,7 +1735,6 @@ class ModuleInterface:
             {track["asin"]: track for track in album_data.get("tracks", [])}
             | {album_id: album_data}
             | mapped_tracks
-            # | {f"{album_id}_page_entity_data": mobile_session.get_page(f"album/{album_id}", count=0, locale="en_US").get("entity", {})}
         )
 
         if search_data:
@@ -1970,7 +1750,7 @@ class ModuleInterface:
             (track.get("parentalControls") or {}).get("hasExplicitLanguage")
             for track in album_data.get("tracks", [])
         )
-        
+
         quality_tags = {
             "official_quality_name": best_audio_track.official_quality_name,
             "codec_pretty_name": codec_data[best_audio_track.codec].pretty_name,
@@ -2003,6 +1783,20 @@ class ModuleInterface:
             },  # optional, whatever you want
         )
 
+    def _fetch_playlist_data(
+        self, mobile_session: AmazonMusicMobileAPI, playlist_id: str, media_region: AmazonRegion
+    ) -> dict:
+        """Fetch a catalog playlist (10-char ASIN, e.g. Top 100) or a user playlist."""
+        if len(playlist_id) == 10:
+            catalog = mobile_session.get_catalog_playlist(playlist_id, region_to_use=media_region)
+            return dict(catalog.get("playlist") or catalog)
+        # A user playlist (either from the shared link, or the address bar)
+        user_resp = mobile_session.get_user_playlist(playlist_id)
+        playlists = user_resp.get("playlists") or []
+        if not playlists:
+            raise TypeError(f"Playlist not found: {playlist_id}")
+        return dict(playlists[0])
+
     def get_playlist_info(
         self, playlist_id: str, media_region: AmazonRegion, data={}
     ) -> (
@@ -2011,23 +1805,22 @@ class ModuleInterface:
         mobile_session, _ = self.select_session(media_region)
 
         cached = data.get(playlist_id) if data and playlist_id in data else None
-        if cached and self._playlist_payload_is_complete(cached):
-            p_data = dict(cached)
-        else:
-            p_data = {}
-
-        if not p_data:
-            if len(playlist_id) == 10:
-                # An ASIN (catalog playlist, e.g. Top 100)
-                catalog = mobile_session.get_catalog_playlist(playlist_id, region_to_use=media_region)
-                p_data = dict(catalog.get("playlist") or catalog)
-            else:
-                # A user playlist (either from the shared link, or the address bar)
-                user_resp = mobile_session.get_user_playlist(playlist_id)
-                playlists = user_resp.get("playlists") or []
-                if not playlists:
-                    raise TypeError(f"Playlist not found: {playlist_id}")
-                p_data = dict(playlists[0])
+        # A cached payload counts only if it's a full playlist API response, not a
+        # text-search hit: metadata.title present and first track (if any) expanded.
+        cache_usable = False
+        if isinstance(cached, dict):
+            meta = cached.get("metadata")
+            if isinstance(meta, dict) and meta.get("title"):
+                tracks = cached.get("tracks")
+                first = tracks[0] if isinstance(tracks, list) and tracks else None
+                cache_usable = first is None or (
+                    isinstance(first, dict) and bool(first.get("metadata") or first.get("asin"))
+                )
+        p_data = (
+            dict(cached)
+            if cache_usable
+            else self._fetch_playlist_data(mobile_session, playlist_id, media_region)
+        )
 
         meta = p_data.get("metadata") if isinstance(p_data.get("metadata"), dict) else {}
         if not meta.get("title"):
@@ -2056,7 +1849,8 @@ class ModuleInterface:
             if not asin:
                 continue
             track_asins.append(asin)
-            track_data[f"{asin}_playlist"] = self._playlist_track_metadata(track)
+            meta = track.get("metadata")
+            track_data[f"{asin}_playlist"] = meta if isinstance(meta, dict) else track
 
         playlist_year = self._entity_release_year(
             p_data, p_data, DownloadTypeEnum.playlist
@@ -2081,6 +1875,35 @@ class ModuleInterface:
             },
         )
 
+    def _batched_album_metadata(
+        self, mobile_session: AmazonMusicMobileAPI, asins: list[str], media_region: AmazonRegion
+    ) -> list[dict]:
+        """
+        Fetch full album metadata for many ASINs concurrently.
+
+        The muse lookup endpoint accepts up to 10 ASINs per request, so batch
+        metadata fetches (94 single calls -> ~10 batched calls) and run them
+        concurrently. Each entry is the same payload as get_album_info.
+        """
+        def _fetch_batch(batch: list[str]) -> list[dict]:
+            try:
+                resp = mobile_session.get_metadata(tuple(batch), region_to_use=media_region)
+                return list(resp.get("albumList") or [])
+            except Exception as ex:
+                LOGGER.debug("Album metadata batch failed (%s): %s", batch, ex)
+                return []
+
+        batches = [asins[i : i + 10] for i in range(0, len(asins), 10)]
+        if not batches:
+            return []
+        fetched: list[dict] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(batches))) as executor:
+            futures = [executor.submit(_fetch_batch, batch) for batch in batches]
+            executor.shutdown(wait=True)
+            for future in concurrent.futures.as_completed(futures):
+                fetched.extend(m for m in future.result() if m)
+        return fetched
+
     def get_artist_info(
         self, artist_id: str, get_credited_albums: bool, media_region: AmazonRegion, data: dict = {}
     ) -> ArtistInfo:  # Mandatory if ModuleModes.download
@@ -2088,7 +1911,7 @@ class ModuleInterface:
 
         # get_credited_albums means stuff like remix compilations the artist was part of
         try:
-            artist_data = mobile_session.get_artist_info(artist_id, region_to_use=media_region)
+            artist_data = mobile_session.get_info(artist_id, "artistList", region_to_use=media_region)
         except Exception as e:
             LOGGER.error(e, exc_info=True)
             raise e
@@ -2103,16 +1926,21 @@ class ModuleInterface:
             f"{module_information.service_name}: Loading albums for {artist_data['name']}, this may take a while.."
         )
 
+        def _search_catalog(query: str, search_types: tuple[str, ...]) -> list:
+            # Fetch a large pool so artist expand can show the full discography.
+            return list(
+                mobile_session.search(
+                    query=query,
+                    search_types=search_types,
+                    limit=1000,
+                    region_to_use=media_region,
+                )
+            )
+
         # Candidate albums from the artist catalog search.
         search_albums = [
             album
-            for album in mobile_session.search(
-                query=f'"{artist_name}"',
-                search_types=("catalog_album",),
-                # Fetch a large pool so artist expand can show the full discography.
-                limit=1000,
-                region_to_use=media_region,
-            )
+            for album in _search_catalog(f'"{artist_name}"', ("catalog_album",))
             if artist_name in album.get("artistName", "")
         ]
 
@@ -2132,21 +1960,9 @@ class ModuleInterface:
             no_new_streak = 0
             for suffix in suffixes:
                 try:
-                    supplemental = list(
-                        mobile_session.search(
-                            query=f'"{artist_name}" {suffix}',
-                            search_types=("catalog_album",),
-                            limit=1000,
-                            region_to_use=media_region,
-                        )
-                    )
+                    supplemental = _search_catalog(f'"{artist_name}" {suffix}', ("catalog_album",))
                 except Exception as ex:
-                    LOGGER.debug(
-                        "Artist supplemental album search failed (%s %s): %s",
-                        artist_name,
-                        suffix,
-                        ex,
-                    )
+                    LOGGER.debug("Artist supplemental album search failed (%s %s): %s", artist_name, suffix, ex)
                     no_new_streak += 1
                     if no_new_streak >= 8:
                         break
@@ -2176,14 +1992,7 @@ class ModuleInterface:
         # Add a secondary source: catalog_track hits -> album ASINs.
         track_album_hits: list[dict] = []
         try:
-            track_hits = list(
-                mobile_session.search(
-                    query=f'"{artist_name}"',
-                    search_types=("catalog_track",),
-                    limit=1000,
-                    region_to_use=media_region,
-                )
-            )
+            track_hits = _search_catalog(f'"{artist_name}"', ("catalog_track",))
             for hit in track_hits:
                 if not isinstance(hit, dict):
                     continue
@@ -2350,17 +2159,12 @@ class ModuleInterface:
                 break
             offset += page_count
 
-        if page_albums:
+        # Merge page-scraped albums and track-derived album hits into the search results.
+        for extra_albums in (page_albums, track_album_hits):
+            if not extra_albums:
+                continue
             seen_search_asins = {str(a.get("asin")) for a in search_albums if isinstance(a, dict) and a.get("asin")}
-            for album in page_albums:
-                asin = str(album.get("asin") or "")
-                if asin and asin not in seen_search_asins:
-                    search_albums.append(album)
-                    seen_search_asins.add(asin)
-
-        if track_album_hits:
-            seen_search_asins = {str(a.get("asin")) for a in search_albums if isinstance(a, dict) and a.get("asin")}
-            for album in track_album_hits:
+            for album in extra_albums:
                 asin = str(album.get("asin") or "")
                 if asin and asin not in seen_search_asins:
                     search_albums.append(album)
@@ -2369,7 +2173,7 @@ class ModuleInterface:
         if getattr(self.options, "debug_mode", False):
             self.print(
                 f"{module_information.service_name}: artist merge debug -> "
-                f"search_albums={len(search_by_asin) if 'search_by_asin' in locals() else len(search_albums)}, "
+                f"search_albums={len(search_albums)}, "
                 f"page_albums={len(page_albums)}, "
                 f"track_album_hits={len(track_album_hits)}, merged_candidates={len(search_albums)}"
             )
@@ -2393,36 +2197,12 @@ class ModuleInterface:
         # concurrently. Full album details (tracks, year, quality flags) are
         # preserved because each entry is the same payload as get_album_info.
         all_asins = list(search_by_asin.keys())
-        asin_batches = [all_asins[i : i + 10] for i in range(0, len(all_asins), 10)]
-
-        def _fetch_batch(asin_batch: list[str]) -> list[dict]:
-            try:
-                resp = mobile_session.get_metadata(
-                    tuple(asin_batch), region_to_use=media_region
-                )
-                return list(resp.get("albumList") or [])
-            except Exception as ex:
-                LOGGER.debug("Album metadata batch failed (%s): %s", asin_batch, ex)
-                return []
-
-        fetched_metadata: list[dict] = []
+        fetched_metadata = self._batched_album_metadata(mobile_session, all_asins, media_region)
         matched_asins: set[str] = set()
-        if asin_batches:
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(8, len(asin_batches))
-            ) as executor:
-                batch_futures = [
-                    executor.submit(_fetch_batch, batch) for batch in asin_batches
-                ]
-                executor.shutdown(wait=True)
-                for future in concurrent.futures.as_completed(batch_futures):
-                    for album_metadata in future.result():
-                        if not album_metadata:
-                            continue
-                        fetched_metadata.append(album_metadata)
-                        hit = _match_search_hit(album_metadata)
-                        if hit is not None and hit.get("asin"):
-                            matched_asins.add(str(hit["asin"]))
+        for album_metadata in fetched_metadata:
+            hit = _match_search_hit(album_metadata)
+            if hit is not None and hit.get("asin"):
+                matched_asins.add(str(hit["asin"]))
 
         # Fallback: fetch any ASINs the batched lookup silently dropped.
         missing_asins = [a for a in all_asins if a not in matched_asins]
@@ -2432,8 +2212,9 @@ class ModuleInterface:
             ) as executor:
                 single_futures = {
                     executor.submit(
-                        mobile_session.get_album_info,
+                        mobile_session.get_info,
                         asin,
+                        "albumList",
                         region_to_use=media_region,
                     ): asin
                     for asin in missing_asins
@@ -2443,11 +2224,7 @@ class ModuleInterface:
                     try:
                         album_metadata = future.result()
                     except Exception as ex:
-                        LOGGER.debug(
-                            "Album metadata fallback failed (%s): %s",
-                            single_futures[future],
-                            ex,
-                        )
+                        LOGGER.debug("Album metadata fallback failed (%s): %s", single_futures[future], ex)
                         continue
                     if album_metadata:
                         fetched_metadata.append(album_metadata)
@@ -2548,40 +2325,26 @@ class ModuleInterface:
         self, track_id: str, cover_options: CoverOptions, media_region: AmazonRegion, data={}, **kwargs
     ) -> CoverInfo:  # Mandatory if ModuleModes.covers
         mobile_session, _ = self.select_session(media_region)
-        
-        track_data = (
-            data[track_id]
-            if track_id in data
-            else mobile_session.get_track_info(track_id, region_to_use=media_region) #music_territory="CY"
+
+        track_data = self._cached_or_fetch(
+            data, track_id,
+            lambda: mobile_session.get_info(track_id, "trackList", region_to_use=media_region),
         )
         album_id = str(track_data["album"]["asin"])
-        album_data = (
-            data[track_id]
-            if track_id in data
-            else mobile_session.get_album_info(album_id, region_to_use=media_region) #music_territory="CY"
+        album_data = self._cached_or_fetch(
+            data, album_id,
+            lambda: mobile_session.get_info(album_id, "albumList", region_to_use=media_region),
         )
 
-        valid_album_asins = [album_id]
-        
-        if asin := album_data.get("requestedAsin"):
-            valid_album_asins.append(asin)
-        if asin := album_data.get("globalAsin"):
-            valid_album_asins.append(asin)
-
-        cover_url, _ = self.get_hi_res_cover(
-            asins=valid_album_asins,
-            query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
+        cover_url, _ = self._resolve_album_cover(
+            album_data,
+            self._valid_album_asins(album_data, album_id),
+            f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
+            mobile_session,
+            media_region,
+            cover_options,
             search_data=data.get(f"{album_id}_search"),
-            mobile_session=mobile_session,
-            media_region=media_region
         )
-        if not cover_url:
-            # Default 600 x 600 cover art
-            cover_url = str(album_data.get("image", ""))
-        else:
-            cover_url = self.format_cover_url(
-                cover_url, cover_options
-            )
 
         return CoverInfo(
             url=cover_url,
@@ -2610,14 +2373,10 @@ class ModuleInterface:
             if not text:
                 continue
             start_time_raw = line.get("startTime")
-            if start_time_raw is None:
-                parsed_lines.append((None, text))
-                continue
             try:
-                start_time = int(start_time_raw)
+                start_time = None if start_time_raw is None else int(start_time_raw)
             except (TypeError, ValueError):
-                parsed_lines.append((None, text))
-                continue
+                start_time = None
             parsed_lines.append((start_time, text))
 
         if parsed_lines:
@@ -2625,7 +2384,8 @@ class ModuleInterface:
                 if start_time is None:
                     embedded_lyrics += f"{text}\n"
                     continue
-                start_time_str = self.milliseconds_to_lrc_time(start_time)
+                # Convert milliseconds to the proper LRC time format [mm:ss.xxx]
+                start_time_str = f"{start_time // 60000:02}:{(start_time // 1000) % 60:02}.{start_time % 1000:03}"
                 embedded_lyrics += f"[{start_time_str}] {text}\n"
                 synced_lyrics += f"[{start_time_str}]{text}\n"
         else:
@@ -2643,7 +2403,16 @@ class ModuleInterface:
             embedded=embedded_lyrics, synced=synced_lyrics
         )  # both optional if not found
 
-    def _search_additional_quality_labels(
+    def _stereo_only_quality_labels(self, labels: typing.Iterable[str]) -> set[str]:
+        return {
+            str(label).strip()
+            for label in labels
+            if label
+            and str(label).strip()
+            and not self._is_spatial_quality_display(str(label), str(label))
+        }
+
+    def _search_quality_labels(
         self,
         mobile_session: AmazonMusicMobileAPI,
         catalog: dict,
@@ -2653,8 +2422,10 @@ class ModuleInterface:
     ) -> typing.Optional[list[str]]:
         """
         Quality from track MPD manifests (same source as expand/download).
-        Search/artist rows sample a few tracks per album for speed; expand still uses all tracks.
-        Returns None to fall back to contentEncoding flags when the probe fails.
+
+        Search/artist rows sample a few tracks per album for speed; expand still uses all
+        tracks. Sampling the first / middle / last track is enough to detect the album's
+        highest tier. Returns None to fall back to contentEncoding flags when the probe fails.
         """
         track_asins: list[str] = []
         if query_type == DownloadTypeEnum.album:
@@ -2668,106 +2439,54 @@ class ModuleInterface:
                     track_asins.append(str(asin))
         if not track_asins:
             return None
-        # Search rows only sample a few tracks; expand/download still inspects every track.
-        probe_asins = self._sample_track_asins_for_quality_probe(
-            track_asins, max_probe=max_track_probe
-        )
+        if len(track_asins) > max_track_probe:
+            indices = sorted({0, len(track_asins) // 2, len(track_asins) - 1})
+            track_asins = [track_asins[i] for i in indices[:max_track_probe]]
+
         try:
-            return self._album_search_quality_labels(
-                mobile_session,
-                probe_asins,
-                media_region,
+            # Same manifest + per-track label pass as get_album_info / expand (force_3d
+            # from settings). Optional second pass with force_3d=False when Amazon omits
+            # UHD on the 3D substitution ASIN.
+            probe_asins = tuple(track_asins)
+            force_3d = self._amazon_force_3d_for_manifest()
+            spatial_labels, stereo_labels, per_track_labels, has_ra360_manifest = (
+                self._probe_manifests_for_quality(
+                    mobile_session, probe_asins, media_region, force_3d=force_3d
+                )
             )
+
+            def _stereo_candidates() -> set[str]:
+                return self._stereo_only_quality_labels(per_track_labels | stereo_labels)
+
+            stereo_candidates = _stereo_candidates()
+            if not self._manifest_labels_include_stereo(stereo_candidates):
+                more_spatial, more_stereo, more_per_track, more_ra360 = (
+                    self._probe_manifests_for_quality(
+                        mobile_session, probe_asins, media_region, force_3d=False
+                    )
+                )
+                spatial_labels |= more_spatial
+                stereo_labels |= more_stereo
+                per_track_labels |= more_per_track
+                has_ra360_manifest = has_ra360_manifest or more_ra360
+                stereo_candidates = _stereo_candidates()
+
+            if not spatial_labels:
+                spatial_only, _, _, _ = self._probe_manifests_for_quality(
+                    mobile_session,
+                    (probe_asins[0],),
+                    media_region,
+                    force_3d=True,
+                )
+                spatial_labels |= spatial_only
+
+            merged = self._merge_manifest_quality_labels(spatial_labels, stereo_candidates)
+            if merged and "3D MPEG-H Audio" in merged and not has_ra360_manifest:
+                merged = [label for label in merged if label != "3D MPEG-H Audio"]
+            return merged or None
         except Exception as ex:
             LOGGER.debug("Search manifest quality probe failed: %s", ex)
             return None
-
-    def _stereo_only_quality_labels(self, labels: typing.Iterable[str]) -> set[str]:
-        return {
-            str(label).strip()
-            for label in labels
-            if label
-            and str(label).strip()
-            and not self._is_spatial_quality_display(str(label), str(label))
-        }
-
-    def _album_search_quality_labels(
-        self,
-        mobile_session: AmazonMusicMobileAPI,
-        track_asins: tuple[str, ...],
-        media_region: AmazonRegion,
-    ) -> typing.Optional[list[str]]:
-        """
-        Same manifest + per-track label pass as get_album_info / expand (force_3d from settings).
-        Optional second pass with force_3d=False when Amazon omits UHD on the 3D substitution ASIN.
-        """
-        if not track_asins:
-            return None
-
-        spatial_labels: set[str] = set()
-        per_track_labels: set[str] = set()
-        collected_stereo: set[str] = set()
-        has_ra360_manifest: bool = False
-        force_3d = self._amazon_force_3d_for_manifest()
-
-        def _ingest_manifests(force_3d_flag: bool) -> None:
-            nonlocal has_ra360_manifest
-            for track_asin, manifest in mobile_session.get_tracks_manifest(
-                track_asins,
-                force_3d=force_3d_flag,
-                region_to_use=media_region,
-            ):
-                if manifest is None:
-                    continue
-                try:
-                    mapped = self.mpd_to_quality_map(
-                        manifest,
-                        track_asin,
-                        mobile_session.credentials.tier,
-                        media_region,
-                        mobile_session.credentials.account_region,
-                    )
-                    if self._mapped_has_spatial_prefix(mapped, "SPATIAL_RA360"):
-                        has_ra360_manifest = True
-                    spatial, stereo = self._collect_manifest_quality_labels(mapped)
-                    spatial_labels |= spatial
-                    collected_stereo |= stereo
-                    label = self._quality_label_from_mapped(
-                        mapped, SEARCH_PROBE_STEREO_TIER
-                    )
-                    if label:
-                        per_track_labels.add(label)
-                except Exception as ex:
-                    LOGGER.debug(
-                        "Album search manifest ingest failed for %s: %s",
-                        track_asin,
-                        ex,
-                    )
-
-        _ingest_manifests(force_3d)
-
-        stereo_candidates = self._stereo_only_quality_labels(
-            per_track_labels | collected_stereo
-        )
-        if not self._manifest_labels_include_stereo(stereo_candidates):
-            _ingest_manifests(False)
-            stereo_candidates = self._stereo_only_quality_labels(
-                per_track_labels | collected_stereo
-            )
-
-        if not spatial_labels and track_asins:
-            spatial_only, _ = self._probe_manifest_quality_label_sets(
-                mobile_session,
-                (track_asins[0],),
-                media_region,
-                force_3d=True,
-            )
-            spatial_labels |= spatial_only
-
-        merged = self._merge_manifest_quality_labels(spatial_labels, stereo_candidates)
-        if merged and "3D MPEG-H Audio" in merged and not has_ra360_manifest:
-            merged = [label for label in merged if label != "3D MPEG-H Audio"]
-        return merged or None
 
     def artist_album_display_meta(
         self,
@@ -2837,36 +2556,20 @@ class ModuleInterface:
         track_info: typing.Optional[TrackInfo] = None,
         limit: int = 10,
     ):  # Mandatory
-        preferred_region = (
-            self.select_usable_region_from_regions(
-                AmazonRegion.get_available_regions_by_continent(
-                    self.settings["prefer_account_continent"]
-                )
-            )
-            or AmazonRegion.get_available_regions_by_continent(
-                self.settings["prefer_account_continent"]
-            )[0]
-        )
+        preferred_region = self._preferred_account_region()
         mobile_session, media_region = self.select_session(preferred_region)
         self.print(f"{module_information.service_name}: Using {media_region.country} for search query ({query})")
 
         results = []
         search_type = f"catalog_{query_type.name}"
-        # if track_info and track_info.tags.isrc:
-        #     results = list(
-        #         mobile_session.search(
-        #             query=track_info.tags.isrc, search_types=(search_type,), limit=limit
-        #         )
-        #     )
-        if not results:
-            results = list(
-                mobile_session.search(
-                    query=query,
-                    search_types=(search_type,),
-                    limit=limit,
-                    region_to_use=media_region
-                )
+        results = list(
+            mobile_session.search(
+                query=query,
+                search_types=(search_type,),
+                limit=limit,
+                region_to_use=media_region
             )
+        )
 
         def _cover_from_item(item: dict) -> typing.Optional[str]:
             art = item.get("artOriginal") or {}
@@ -2903,27 +2606,13 @@ class ModuleInterface:
                 return None
             try:
                 if query_type == DownloadTypeEnum.playlist:
-                    if len(str(asin)) == 10:
-                        resp = mobile_session.get_catalog_playlist(
-                            str(asin), region_to_use=media_region
-                        )
-                        return dict(resp.get("playlist") or resp)
-                    user_resp = mobile_session.get_user_playlist(str(asin))
-                    playlists = user_resp.get("playlists") or []
-                    if playlists:
-                        return dict(playlists[0])
-                elif query_type == DownloadTypeEnum.album:
-                    return dict(
-                        mobile_session.get_album_info(str(asin), region_to_use=media_region)
-                    )
+                    return self._fetch_playlist_data(mobile_session, str(asin), media_region)
+                return dict(
+                    mobile_session.get_info(str(asin), "albumList", region_to_use=media_region)
+                )
             except Exception as ex:
                 LOGGER.debug("Catalog metadata fetch failed for %s: %s", asin, ex)
             return None
-
-        def _search_release_year(
-            item: dict, catalog: typing.Optional[dict] = None
-        ) -> typing.Optional[str]:
-            return self._entity_release_year(item, catalog, query_type)
 
         def _search_duration_seconds(
             item: dict, catalog: typing.Optional[dict] = None
@@ -2956,6 +2645,14 @@ class ModuleInterface:
                     if tag not in catalog_tags:
                         catalog_tags.append(tag)
 
+            def _finalize(labels: list[str]) -> list[str]:
+                """Atmos from catalog flags when the probe missed it, else stereo + catalog UHD/HD."""
+                if not self._quality_labels_include_atmos(labels):
+                    atmos = self._catalog_atmos_display_label(catalog) or self._catalog_atmos_display_label(item)
+                    if atmos:
+                        return [atmos]
+                return self._supplement_stereo_quality_from_catalog(labels, item, catalog)
+
             if catalog and query_type in (
                 DownloadTypeEnum.album,
                 DownloadTypeEnum.playlist,
@@ -2966,27 +2663,13 @@ class ModuleInterface:
                         catalog_tags
                     )
                     if catalog_labels:
-                        if not self._quality_labels_include_atmos(catalog_labels):
-                            atmos = self._catalog_atmos_display_label(
-                                catalog
-                            ) or self._catalog_atmos_display_label(item)
-                            if atmos:
-                                return [atmos]
-                        return self._supplement_stereo_quality_from_catalog(
-                            catalog_labels, item, catalog
-                        )
+                        return _finalize(catalog_labels)
 
-                manifest_labels = self._search_additional_quality_labels(
+                manifest_labels = self._search_quality_labels(
                     mobile_session, catalog, media_region, query_type
                 )
                 if manifest_labels is not None:
-                    if not self._quality_labels_include_atmos(manifest_labels):
-                        atmos = self._catalog_atmos_display_label(catalog) or self._catalog_atmos_display_label(item)
-                        if atmos:
-                            return [atmos]
-                    return self._supplement_stereo_quality_from_catalog(
-                        manifest_labels, item, catalog
-                    )
+                    return _finalize(manifest_labels)
             if query_type == DownloadTypeEnum.track:
                 track_asin = item.get("asin")
                 if track_asin:
@@ -2994,15 +2677,7 @@ class ModuleInterface:
                         mobile_session, str(track_asin), media_region
                     )
                     if probed:
-                        if not self._quality_labels_include_atmos(probed):
-                            atmos = self._catalog_atmos_display_label(item) or (
-                                self._catalog_atmos_display_label(catalog) if catalog else None
-                            )
-                            if atmos:
-                                return [atmos]
-                        return self._supplement_stereo_quality_from_catalog(
-                            probed, item, catalog
-                        )
+                        return _finalize(probed)
             if catalog_tags:
                 return self._amazon_catalog_quality_display_labels(catalog_tags)
             return []
@@ -3018,7 +2693,7 @@ class ModuleInterface:
                 DownloadTypeEnum.playlist,
             ):
                 return None
-            year = _search_release_year(item, catalog)
+            year = self._entity_release_year(item, catalog, query_type)
             if year:
                 return year
             if query_type == DownloadTypeEnum.track:
@@ -3061,52 +2736,25 @@ class ModuleInterface:
             needed_album_asins: list[str] = []
             seen_album_asins: set[str] = set()
             for item in results:
-                if not isinstance(item, dict) or _search_release_year(item, None):
+                if not isinstance(item, dict) or self._entity_release_year(item, None, query_type):
                     continue
                 album_asin = _track_album_asin(item)
                 if album_asin and album_asin not in seen_album_asins:
                     seen_album_asins.add(album_asin)
                     needed_album_asins.append(album_asin)
 
-            if needed_album_asins:
-                year_batches = [
-                    needed_album_asins[i : i + 10]
-                    for i in range(0, len(needed_album_asins), 10)
-                ]
-
-                def _fetch_year_batch(batch: list[str]) -> list[dict]:
-                    try:
-                        resp = mobile_session.get_metadata(
-                            tuple(batch), region_to_use=media_region
-                        )
-                        return list(resp.get("albumList") or [])
-                    except Exception as ex:
-                        LOGGER.debug(
-                            "Track-year album metadata batch failed (%s): %s", batch, ex
-                        )
-                        return []
-
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=min(8, len(year_batches))
-                ) as executor:
-                    year_futures = [
-                        executor.submit(_fetch_year_batch, batch)
-                        for batch in year_batches
-                    ]
-                    executor.shutdown(wait=True)
-                    for future in concurrent.futures.as_completed(year_futures):
-                        for album_meta in future.result():
-                            if not isinstance(album_meta, dict):
-                                continue
-                            year = self._year_from_date_fields(
-                                album_meta, self._ALBUM_YEAR_KEYS
-                            )
-                            if not year:
-                                continue
-                            for key in ("requestedAsin", "asin", "globalAsin"):
-                                asin_val = album_meta.get(key)
-                                if asin_val:
-                                    album_year_backfill[str(asin_val)] = year
+            for album_meta in self._batched_album_metadata(
+                mobile_session, needed_album_asins, media_region
+            ):
+                if not isinstance(album_meta, dict):
+                    continue
+                year = self._year_from_date_fields(album_meta, self._ALBUM_YEAR_KEYS)
+                if not year:
+                    continue
+                for key in ("requestedAsin", "asin", "globalAsin"):
+                    asin_val = album_meta.get(key)
+                    if asin_val:
+                        album_year_backfill[str(asin_val)] = year
 
         if query_type in (DownloadTypeEnum.album, DownloadTypeEnum.playlist) and len(results) > 1:
             # Album rows: sequential catalog fetch + optional 3-track MPD sample (session not thread-safe).
@@ -3130,9 +2778,8 @@ class ModuleInterface:
         query: str,
         mobile_session: AmazonMusicMobileAPI,
         media_region: AmazonRegion,
-        search_data: typing.Optional[dict] = {},
+        search_data: typing.Optional[dict] = None,
     ):
-        search_data = {}
         cover_url = None
 
         # Typically this works
@@ -3157,7 +2804,6 @@ class ModuleInterface:
             # e.g tracks with the label "Amazon Content Service"
             # We have to trust that Amazon Search API returns the correct playlist that has the album/track inside of it
             for p_search_data in mobile_session.search(
-                # query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
                 query=query,
                 search_types=("catalog_playlist",),
                 limit=100,
@@ -3304,11 +2950,6 @@ class ModuleInterface:
         return datetime.fromtimestamp(proper_ts)
 
     @staticmethod
-    def milliseconds_to_lrc_time(milliseconds: int):
-        # Convert milliseconds to the proper LRC time format [mm:ss.xxx]
-        return f"{milliseconds // 60000:02}:{(milliseconds // 1000) % 60:02}.{milliseconds % 1000:03}"
-
-    @staticmethod
     def sanitize_parental_status_name(name: str):
         sanitized = re.split(r"(\s\[Explicit\]|\s\[Clean\])$", name, maxsplit=1)
         if len(sanitized) >= 2:
@@ -3343,16 +2984,6 @@ class ModuleInterface:
 
         return new_url
 
-    def download(self, url: str, location: str, use_aria2c: typing.Optional[bool]):
-        # OrpheusDL default downloader only (aria2c/aria2p not supported in this distribution)
-        indent = getattr(self.module_controller.printer_controller, "indent_number", 0)
-        download_file(
-            url,
-            location,
-            enable_progress_bar=bool(self.module_controller.progress_bar_enabled),
-            indent_level=indent,
-        )
-
     def _print_quality_notice_once(self, key: str, message: str) -> None:
         """Avoid per-track spam when max_track_quality_to_use applies to a whole album."""
         with self._quality_notice_lock:
@@ -3366,30 +2997,17 @@ class ModuleInterface:
         return bool(codec_data[track.codec].spatial)
 
     @staticmethod
-    def _is_ra360_audio_track(track: AudioTrack) -> bool:
-        quality = str(track.quality or "").upper()
-        if quality.startswith("SPATIAL_RA360"):
-            return True
-        return track.codec in (CodecEnum.MHA1, CodecEnum.MHM1)
-
-    @staticmethod
-    def _is_atmos_audio_track(track: AudioTrack) -> bool:
-        quality = str(track.quality or "").upper()
-        if quality.startswith("SPATIAL_ATMOS"):
-            return True
-        return track.codec in (CodecEnum.EAC3, CodecEnum.AC4)
-
-    @staticmethod
     def _spatial_manifest_badge(track: AudioTrack) -> str:
         """Search/download badge from MPD track type + codec (not catalog 'immersive')."""
-        if ModuleInterface._is_ra360_audio_track(track):
+        quality = str(track.quality or "").upper()
+        if quality.startswith("SPATIAL_RA360") or track.codec in (CodecEnum.MHA1, CodecEnum.MHM1):
             return "3D MPEG-H Audio"
-        if ModuleInterface._is_atmos_audio_track(track):
+        if quality.startswith("SPATIAL_ATMOS") or track.codec in (CodecEnum.EAC3, CodecEnum.AC4):
             return "◗◖ ATMOS"
-        if ModuleInterface._is_spatial_audio_track(track):
-            codec_name = codec_data[track.codec].pretty_name
-            official = str(track.official_quality_name or "")
-            return ModuleInterface._amazon_spatial_display_label(codec_name, official)
+        if bool(codec_data[track.codec].spatial):
+            return ModuleInterface._amazon_spatial_display_label(
+                codec_data[track.codec].pretty_name, str(track.official_quality_name or "")
+            )
         return ""
 
     @staticmethod
@@ -3407,33 +3025,6 @@ class ModuleInterface:
         return False
 
     @staticmethod
-    def _quality_prefix_is_spatial(quality_prefix: str) -> bool:
-        return str(quality_prefix or "").upper().startswith("SPATIAL")
-
-    def _select_track_for_quality_prefix(
-        self,
-        mapped_audio_tracks: dict[QualityEnum, dict[str, list[AudioTrack]]],
-        quality_enum: QualityEnum,
-        quality_prefix: str,
-        *,
-        spatial_only: bool,
-        stereo_only: bool,
-    ) -> AudioTrack | None:
-        tier_tracks = mapped_audio_tracks.get(quality_enum) or {}
-        for _group_name, tracks in tier_tracks.items():
-            if not tracks:
-                continue
-            for track in tracks:
-                if not track.quality.startswith(quality_prefix):
-                    continue
-                is_spatial = self._is_spatial_audio_track(track)
-                if stereo_only and is_spatial:
-                    continue
-                if spatial_only and not is_spatial:
-                    continue
-                return track
-        return None
-
     def _select_audio_track_for_tier(
         self,
         mapped_audio_tracks: dict[QualityEnum, dict[str, list[AudioTrack]]],
@@ -3442,12 +3033,10 @@ class ModuleInterface:
         *,
         to_print: bool = False,
     ) -> AudioTrack | None:
-        allow_spatial = True
-        if codec_options is not None and not codec_options.spatial_codecs:
-            allow_spatial = False
-        if self.settings.get("force_non_spatial", False):
-            allow_spatial = False
-
+        allow_spatial = not (
+            (codec_options is not None and not codec_options.spatial_codecs)
+            or self.settings.get("force_non_spatial", False)
+        )
         want_spatial = (
             allow_spatial
             and quality_tier.value >= QualityEnum.ATMOS.value
@@ -3462,42 +3051,34 @@ class ModuleInterface:
                 continue
             tier_order.append((quality_enum, prefixes))
 
-        if want_spatial:
+        def _find_track(spatial_only: bool) -> AudioTrack | None:
             for quality_enum, prefixes in tier_order:
                 for quality_prefix in prefixes:
-                    if not self._quality_prefix_is_spatial(quality_prefix):
+                    if quality_prefix.startswith("SPATIAL") != spatial_only:
                         continue
-                    track = self._select_track_for_quality_prefix(
-                        mapped_audio_tracks,
-                        quality_enum,
-                        quality_prefix,
-                        spatial_only=True,
-                        stereo_only=False,
+                    for tracks in (mapped_audio_tracks.get(quality_enum) or {}).values():
+                        if not tracks:
+                            continue
+                        for track in tracks:
+                            if not track.quality.startswith(quality_prefix):
+                                continue
+                            if self._is_spatial_audio_track(track) != spatial_only:
+                                continue
+                            return track
+            return None
+
+        if want_spatial:
+            track = _find_track(spatial_only=True)
+            if track:
+                if to_print:
+                    self._print_quality_notice_once(
+                        f"spatial:{track.quality}",
+                        f"{module_information.service_name}: Downloading spatial audio "
+                        f"({track.quality}).",
                     )
-                    if track:
-                        if to_print:
-                            self._print_quality_notice_once(
-                                f"spatial:{track.quality}",
-                                f"{module_information.service_name}: Downloading spatial audio "
-                                f"({track.quality}).",
-                            )
-                        return track
+                return track
 
-        for quality_enum, prefixes in tier_order:
-            for quality_prefix in prefixes:
-                if self._quality_prefix_is_spatial(quality_prefix):
-                    continue
-                track = self._select_track_for_quality_prefix(
-                    mapped_audio_tracks,
-                    quality_enum,
-                    quality_prefix,
-                    spatial_only=False,
-                    stereo_only=True,
-                )
-                if track:
-                    return track
-
-        return None
+        return _find_track(spatial_only=False)
 
     def _get_usable_audio_track_of_mapped_quailty(
         self,
@@ -3513,22 +3094,21 @@ class ModuleInterface:
 
         if max_track_quality_to_use := self.settings["max_track_quality_to_use"]:
             max_track_quality_to_use = str(max_track_quality_to_use).upper()
-            for _quality_enum, _quality_name, tracks in mapped_qual_tracks:
-                if not tracks:
-                    continue
-                for track in tracks:
-                    if not track.quality.startswith(max_track_quality_to_use):
-                        continue
-                    track_to_use = track
-                    break
-                if track_to_use:
-                    if to_print:
-                        self._print_quality_notice_once(
-                            f"matched:{max_track_quality_to_use}",
-                            f"{module_information.service_name}: Using {max_track_quality_to_use} "
-                            "quality where available.",
-                        )
-                    break
+            track_to_use = next(
+                (
+                    track
+                    for _quality_enum, _quality_name, tracks in mapped_qual_tracks
+                    for track in tracks or ()
+                    if track.quality.startswith(max_track_quality_to_use)
+                ),
+                None,
+            )
+            if track_to_use and to_print:
+                self._print_quality_notice_once(
+                    f"matched:{max_track_quality_to_use}",
+                    f"{module_information.service_name}: Using {max_track_quality_to_use} "
+                    "quality where available.",
+                )
 
             if not track_to_use and to_print:
                 self._print_quality_notice_once(
@@ -3617,30 +3197,25 @@ class ModuleInterface:
             and account_region.region == media_region.region
         )
 
-        # print(f"{has_entitlements=}, {has_katana_tier=}, {available_entitlements=}")
         if (
             has_entitlements or has_katana_tier
         ):
-            # print("flac")
             preferred_codecs.append(CodecEnum.FLAC)
 
             if not self.settings["force_non_spatial"]:
-                if self.settings["prefer_spatial_mha1"]:
-                    preferred_codecs.append(CodecEnum.MHA1)
-                else:
-                    preferred_codecs.append(CodecEnum.MHM1)
+                preferred_codecs.append(
+                    CodecEnum.MHA1 if self.settings["prefer_spatial_mha1"] else CodecEnum.MHM1
+                )
+                preferred_codecs.append(
+                    CodecEnum.AC4 if self.settings["prefer_spatial_ac4"] else CodecEnum.EAC3
+                )
 
-                if self.settings["prefer_spatial_ac4"]:
-                    preferred_codecs.append(CodecEnum.AC4)
-                else:
-                    preferred_codecs.append(CodecEnum.EAC3)
-        
         mapped_audio_tracks = self.tracks_to_quality_map(
             avaliable_tracks, preferred_codecs, entitlements_only=has_entitlements, allow_web_pssh=has_katana_tier
         )
         LOGGER.debug(mapped_audio_tracks)
         return mapped_audio_tracks
-    
+
     def get_decrypted_key(self, enc_key: bytes, pssh: PSSH, enc_key_type: str):
         pssh_data = WidevinePsshData()
         pssh_data.ParseFromString(pssh.init_data)
@@ -3649,21 +3224,20 @@ class ModuleInterface:
         LOGGER.debug(f"Using {enc_key.hex()} as the master key.")
         LOGGER.debug(f"Raw encrypted key ID and key: {entitled_key.key_id.hex()}:{entitled_key.key.hex()}")
         key_id = entitled_key.key_id.hex()
-        
+
         cipher = AES.new(enc_key, AES.MODE_CBC, entitled_key.iv)
         raw_final_key = cipher.decrypt(entitled_key.key)
-        
+
         if enc_key_type == "ENTITLEMENT":
             final_key = raw_final_key.hex()
         elif enc_key_type == "CONTENT":
             final_key = raw_final_key[:16].hex()
         else:
             raise ValueError(f"enc_key_type must be ENTITLEMENT or CONTENT, not {enc_key_type}")
-        
+
         LOGGER.debug(f"Raw key ({enc_key_type}): {raw_final_key.hex()}, IV: {entitled_key.iv.hex()}")
 
         return key_id, final_key
-        
 
     def get_audios_from_mpd(self, manifest: ElementTree.Element, track_asin: str):
         """
@@ -3702,10 +3276,10 @@ class ModuleInterface:
                     "value"
                 ):
                     web_pssh = PSSH(content_protection.find("drm:pssh", ns).text, strict=True)
-                    
+
             if not web_pssh:
                 LOGGER.warning("Failed to find the PSSH for web playback. License acquisition may fail.")
-            
+
             official_quality_name = ""
             audio_ref_loudness = ""
 
@@ -3713,9 +3287,7 @@ class ModuleInterface:
                 # Get track type property (LD, SD, HD, SD)
                 if prop.get("schemeIdUri") == "amz-music:trackType":
                     official_quality_name = prop.get("value", "Unknown")
-                    LOGGER.debug(
-                        f"Official name for track: {official_quality_name}"
-                    )
+                    LOGGER.debug(f"Official name for track: {official_quality_name}")
                     continue
 
                 # Get track loudness property
@@ -3776,24 +3348,19 @@ class ModuleInterface:
                         ),
                         url=media_url,
                         official_quality_name=official_quality_name,
-                        quality_ranking=int(
-                            representation.get("qualityRanking", 0)
-                        ),
                         quality=quality,
                         entitlements=PSSHEntitlements(**entitlement_psshs),
                         web_pssh=web_pssh,
                         reference_loudness=audio_ref_loudness,
                     )
                 )
-                
+
         if not avaliable_tracks:
             raise ValueError("No tracks found!")
 
         avaliable_tracks = natsort.natsorted(
             avaliable_tracks, key=lambda x: x.quality, reverse=False
         )
-        # import pprint
-        # pprint.pprint(avaliable_tracks)
         return avaliable_tracks
 
     @staticmethod
@@ -3805,10 +3372,7 @@ class ModuleInterface:
             if not quality_tracks:
                 continue
             for quality_name, tracks in quality_tracks.items():
-                # print(f"{quality_enum=}, {quality_name=}, {tracks=}")
                 yield quality_enum, quality_name, tracks
-
-        return
 
     def tracks_to_quality_map(
         self,
@@ -3834,45 +3398,54 @@ class ModuleInterface:
         """
         quality_to_track_mapping = {}
 
-        for quality_enum, qualities in reversed(self.quality_parse.items()):
-            def key_for_sorting_avaliable_tracks(track: AudioTrack):
-                return track.bitrate
-
-            def key_for_filtering_audiotracks(track: AudioTrack):
-                if allow_web_pssh and not track.web_pssh:
-                    return
-                elif entitlements_only and not track.entitlements.music_territory:
-                    return
-                for quality in qualities:
-                    if not (
-                        track.quality.startswith(quality)
-                        and track.codec in preferred_codecs
-                    ):
-                        continue
-                    return quality
+        def key_for_filtering_audiotracks(track: AudioTrack):
+            if allow_web_pssh and not track.web_pssh:
                 return
+            elif entitlements_only and not track.entitlements.music_territory:
+                return
+            for quality in qualities:
+                if not (
+                    track.quality.startswith(quality)
+                    and track.codec in preferred_codecs
+                ):
+                    continue
+                return quality
+            return
 
-            def key_for_grouping_audiotracks(track: AudioTrack):
-                return track.official_quality_name
-
-            # AudioTracks are sorted best quality to worse
-            
+        for quality_enum, qualities in reversed(self.quality_parse.items()):
+            # AudioTracks are sorted best quality to worst
             grouped_tracks = OrderedDict([
                 (key, natsort.natsorted(
-                    group, key=key_for_sorting_avaliable_tracks, reverse=True
+                    group, key=lambda track: track.bitrate, reverse=True
                 ))
                 for key, group in itertools.groupby(
                     [item for item in tracks if key_for_filtering_audiotracks(item)],
-                    key=key_for_grouping_audiotracks,
+                    key=lambda track: track.official_quality_name,
                 )
             ])
 
             quality_to_track_mapping.update({quality_enum: grouped_tracks})
 
-        # import pprint
-        # pprint.pprint(quality_to_track_mapping)
-
         return quality_to_track_mapping
+
+    @staticmethod
+    def _run_decryption_tool(args: list[str], env, cwd: str, out_path: str) -> subprocess.CompletedProcess:
+        """Run a decryption tool with console-window suppression, clearing any previous output."""
+        if os.path.isfile(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+        run_kwargs = {
+            "args": args,
+            "env": env,
+            "cwd": cwd,
+            "capture_output": True,
+            "text": True,
+        }
+        if sys.platform == "win32":
+            run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        return subprocess.run(**run_kwargs)
 
     @staticmethod
     def _try_mp4decrypt(encrypted_file: str, destination_file: str, key_id: str, key: str) -> bool:
@@ -3884,8 +3457,8 @@ class ModuleInterface:
         enc_path = os.path.abspath(encrypted_file)
         out_path = os.path.abspath(destination_file)
         env = get_clean_env()
-        tool_dir = str(executable.parent)
-        env["PATH"] = tool_dir + os.pathsep + env.get("PATH", "")
+        env["PATH"] = str(executable.parent) + os.pathsep + env.get("PATH", "")
+        cwd = os.path.dirname(enc_path) or os.getcwd()
 
         # KID:key (CENC), then track index fallbacks per Bento4 docs.
         key_specs = (
@@ -3894,21 +3467,12 @@ class ModuleInterface:
             f"0:{key}",
         )
         for key_spec in key_specs:
-            if os.path.isfile(out_path):
-                try:
-                    os.remove(out_path)
-                except OSError:
-                    pass
-            run_kwargs = {
-                "args": [str(executable), "--key", key_spec, enc_path, out_path],
-                "env": env,
-                "cwd": os.path.dirname(enc_path) or os.getcwd(),
-                "capture_output": True,
-                "text": True,
-            }
-            if sys.platform == "win32":
-                run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-            result = subprocess.run(**run_kwargs)
+            result = ModuleInterface._run_decryption_tool(
+                [str(executable), "--key", key_spec, enc_path, out_path],
+                env,
+                cwd,
+                out_path,
+            )
             if result.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
                 LOGGER.info(
                     "mp4decrypt decrypted %s bytes (key spec %s)",
@@ -3954,45 +3518,31 @@ class ModuleInterface:
         ]
 
         env = get_clean_env()
-        packager_dir = str(executable.parent)
-        env["PATH"] = packager_dir + os.pathsep + env.get("PATH", "")
+        env["PATH"] = str(executable.parent) + os.pathsep + env.get("PATH", "")
+        cwd = os.path.dirname(enc_path) or os.getcwd()
         last_detail = ""
         last_returncode = 1
         packager_args: list[str] = []
 
         for stream_descriptor in stream_variants:
-            if os.path.isfile(out_path):
-                try:
-                    os.remove(out_path)
-                except OSError:
-                    pass
-
             packager_args = [
                 stream_descriptor,
                 "--enable_raw_key_decryption",
                 keys_arg,
             ]
-            run_kwargs = {
-                "args": [str(executable), *packager_args],
-                "env": env,
-                "cwd": os.path.dirname(enc_path) or os.getcwd(),
-                "capture_output": True,
-                "text": True,
-            }
-            if sys.platform == "win32":
-                run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-            result = subprocess.run(**run_kwargs)
+            result = ModuleInterface._run_decryption_tool(
+                [str(executable), *packager_args],
+                env,
+                cwd,
+                out_path,
+            )
             last_returncode = result.returncode
             stderr = (result.stderr or "").strip()
             stdout = (result.stdout or "").strip()
             last_detail = stderr or stdout or f"exit code {result.returncode}"
 
             if result.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
-                LOGGER.debug(
-                    "Shaka Packager OK (%s bytes decrypted)",
-                    os.path.getsize(out_path),
-                )
+                LOGGER.debug("Shaka Packager OK (%s bytes decrypted)", os.path.getsize(out_path))
                 return
 
             if result.returncode == 0:

@@ -1,5 +1,5 @@
 import dataclasses
-from datetime import datetime, timedelta
+from datetime import datetime
 import typing
 import enum
 import rsa
@@ -55,10 +55,6 @@ class AmazonMusicMobileAPICredentials:
         return all(name in creds_to_test for name in AmazonMusicMobileAPICredentials.__dataclass_fields__.keys())
 
     @property
-    def access_token_expires(self) -> timedelta:
-        return self.expires - datetime.now()
-
-    @property
     def access_token_expired(self) -> bool:
         return self.expires < datetime.now()
 
@@ -90,15 +86,11 @@ class AmazonRegion:
     pretty_name: str
     locale: str
     domain_tld: str
-    
-    def to_dict(self):
-        return dataclasses.asdict(self)
-    
+
     @classmethod
     @functools.lru_cache
     def get_known_regions(cls):
         # NOTE: country > instance
-        
         init_data: dict[str, list[tuple[str, str, str, str, str]]] = {
             "NA": [
                 ("US", "ATVPDKIKX0DER", "United States of America", "en_US", "com"),
@@ -156,16 +148,6 @@ class AmazonRegion:
                 ("NZ", "A39IBJ37TRP1C6", "New Zealand", "en_NZ", "com.au"),
             ]
         }
-        # Member must satisfy enum value set: [
-            # US, ATVPDKIKX0DER,
-            # GB, A1F83G8C2ARO7P,
-            # DE, A1PA6795UKMFR9,
-            # ES, A1RKKUPIHCS9HS,
-            # JP, A1VC38T7YXB528,
-            # FR, A13V1IB3VIYZZH,
-            # IT, APJ6JRA9NG5V4
-        # ]
-        
         data = {
             country: cls(AmazonContinent[region_name], country, marketplace_id, pretty_name, locale, domain_tld)
             for region_name, regions in init_data.items()
@@ -173,22 +155,20 @@ class AmazonRegion:
         }
 
         return data
-    
+
     @classmethod
     def get_region_by_country(cls, country: str):
         selected_region = cls.get_known_regions().get(country)
         if not selected_region:
             raise TypeError(f"Requested country is not known! {country}")
         return selected_region
-    
+
     @classmethod
     def get_available_regions_by_continent(cls, continent: str):
-        def key_for_grouping_by_continent(inst: AmazonRegion):
-            return inst.region
-        
-        for group_continent, items in itertools.groupby(cls.get_known_regions().values(), key=key_for_grouping_by_continent):
+        for group_continent, items in itertools.groupby(
+            cls.get_known_regions().values(), key=lambda inst: inst.region
+        ):
             if group_continent.name != continent:
                 continue
-            data = list(items)
-            return data
+            return list(items)
         raise RuntimeError("No regions loaded?")
