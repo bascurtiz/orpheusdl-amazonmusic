@@ -3024,7 +3024,6 @@ class ModuleInterface:
                     return True
         return False
 
-    @staticmethod
     def _select_audio_track_for_tier(
         self,
         mapped_audio_tracks: dict[QualityEnum, dict[str, list[AudioTrack]]],
