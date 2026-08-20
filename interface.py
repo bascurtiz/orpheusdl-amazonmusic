@@ -1873,8 +1873,12 @@ class ModuleInterface:
             if not asin:
                 continue
             track_asins.append(asin)
-            meta = track.get("metadata")
-            track_data[f"{asin}_playlist"] = meta if isinstance(meta, dict) else track
+            # Keep the playlist-level `meta` intact: this is the per-track
+            # metadata that gets passed through as `{asin}_playlist`.
+            track_meta = track.get("metadata")
+            track_data[f"{asin}_playlist"] = (
+                track_meta if isinstance(track_meta, dict) else track
+            )
 
         playlist_year = self._entity_release_year(
             p_data, p_data, DownloadTypeEnum.playlist
