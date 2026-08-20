@@ -1449,6 +1449,30 @@ class ModuleInterface:
         return natsort.natsorted(tags, key=len)
 
     @staticmethod
+    def _parse_khz_bit_display_label(label: str) -> typing.Optional[tuple[float, int]]:
+        m = re.search(
+            r"(\d+(?:\.\d+)?)\s*kHz\s*/\s*(\d+)\s*bit",
+            str(label or ""),
+            re.IGNORECASE,
+        )
+        if not m:
+            return None
+        try:
+            return float(m.group(1)), int(m.group(2))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _is_hi_res_lossless(sample_rate_khz: float, bit_depth: int) -> bool:
+        """Same rule as Apple Music / Qobuz search: hi-res only above 48 kHz at 24-bit+."""
+        return float(sample_rate_khz) > 48.0 and int(bit_depth) >= 24
+
+    @staticmethod
+    def _is_amazon_uhd_lossless(sample_rate_khz: float, bit_depth: int) -> bool:
+        """Amazon Ultra HD is commonly 48 kHz / 24-bit (catalog + MPD UHD tier)."""
+        return float(sample_rate_khz) >= 48.0 and int(bit_depth) >= 24
+
+    @staticmethod
     def _amazon_manifest_label_for_display(label: str) -> str:
         """MPD-derived label → ATMOS / kHz·bit / HI-RES / OPUS only (never catalog UHD flags)."""
         text = str(label or "").strip()
