@@ -994,25 +994,31 @@ class ModuleInterface:
             selected_codec_data = codec_data[audio_track.codec]
 
             if selected_codec_data.spatial:
-                # Remux (stream copy) into the proper container: MHM1 (360RA) -> .mp4,
-                # MHA1 -> .m4a. No transcode — mirrors the Tidal Atmos handling.
-                spatial_output_location = (
-                    f"{create_temp_filename()}.{selected_codec_data.container.name}"
-                )
-                try:
-                    out_kwargs = {"acodec": "copy", "loglevel": "warning"}
-                    if spatial_output_location.lower().endswith((".m4a", ".mp4")):
-                        out_kwargs["movflags"] = "+faststart"
-                    ffmpeg.input(decrypted_track_location).output(
-                        spatial_output_location, **out_kwargs
-                    ).run()
-                    silentremove(decrypted_track_location)
-                except Exception:
-                    self.print(
-                        f"{module_information.service_name}: FFmpeg remux of spatial "
-                        "audio failed, using decrypted file as-is."
+                spatial_output_location = decrypted_track_location
+                if audio_track.codec in (CodecEnum.EAC3, CodecEnum.AC4):
+                    # Dolby Atmos (EAC3/AC4): ffmpeg understands these, so remux
+                    # (stream copy) into the proper M4A container — mirrors Tidal.
+                    spatial_output_location = (
+                        f"{create_temp_filename()}.{selected_codec_data.container.name}"
                     )
-                    spatial_output_location = decrypted_track_location
+                    try:
+                        out_kwargs = {"acodec": "copy", "loglevel": "warning"}
+                        if spatial_output_location.lower().endswith((".m4a", ".mp4")):
+                            out_kwargs["movflags"] = "+faststart"
+                        ffmpeg.input(decrypted_track_location).output(
+                            spatial_output_location, **out_kwargs
+                        ).run()
+                        silentremove(decrypted_track_location)
+                    except Exception:
+                        self.print(
+                            f"{module_information.service_name}: FFmpeg remux of Atmos "
+                            "audio failed, using decrypted file as-is."
+                        )
+                        spatial_output_location = decrypted_track_location
+                # MHA1/MHM1 (Sony 360RA MPEG-H 3D Audio): ffmpeg has no muxer for
+                # these, so a remux is impossible AND unnecessary — the shaka-decrypted
+                # file is already a valid MP4 container. The downloader names it with
+                # the proper extension via different_codec (MHA1 -> .m4a, MHM1 -> .mp4).
                 return TrackDownloadInfo(
                     download_type=DownloadEnum.TEMP_FILE_PATH,
                     temp_file_path=spatial_output_location,
