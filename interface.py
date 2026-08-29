@@ -994,9 +994,28 @@ class ModuleInterface:
             selected_codec_data = codec_data[audio_track.codec]
 
             if selected_codec_data.spatial:
+                # Remux (stream copy) into the proper container: MHM1 (360RA) -> .mp4,
+                # MHA1 -> .m4a. No transcode — mirrors the Tidal Atmos handling.
+                spatial_output_location = (
+                    f"{create_temp_filename()}.{selected_codec_data.container.name}"
+                )
+                try:
+                    out_kwargs = {"acodec": "copy", "loglevel": "warning"}
+                    if spatial_output_location.lower().endswith((".m4a", ".mp4")):
+                        out_kwargs["movflags"] = "+faststart"
+                    ffmpeg.input(decrypted_track_location).output(
+                        spatial_output_location, **out_kwargs
+                    ).run()
+                    silentremove(decrypted_track_location)
+                except Exception:
+                    self.print(
+                        f"{module_information.service_name}: FFmpeg remux of spatial "
+                        "audio failed, using decrypted file as-is."
+                    )
+                    spatial_output_location = decrypted_track_location
                 return TrackDownloadInfo(
                     download_type=DownloadEnum.TEMP_FILE_PATH,
-                    temp_file_path=decrypted_track_location,
+                    temp_file_path=spatial_output_location,
                     different_codec=audio_track.codec,
                 )
 
