@@ -26,8 +26,10 @@ from utils.models import *
 from utils.utils import (
     create_temp_filename,
     download_file,
+    find_system_ffmpeg,
     get_clean_env,
     read_temporary_setting,
+    resolve_ffmpeg_with_opus,
     resolve_mp4decrypt,
     resolve_shaka_packager,
     silentremove,
@@ -1005,9 +1007,13 @@ class ModuleInterface:
                         out_kwargs = {"acodec": "copy", "loglevel": "warning"}
                         if spatial_output_location.lower().endswith((".m4a", ".mp4")):
                             out_kwargs["movflags"] = "+faststart"
+                        # Use an ffmpeg that can encode Opus (prefer the app/bundled one,
+                        # falling back down PATH if it lacks Opus) rather than silently failing.
+                        _pref2 = find_system_ffmpeg()[1]
+                        _ff2_path = resolve_ffmpeg_with_opus(preferred=_pref2) or 'ffmpeg'
                         ffmpeg.input(decrypted_track_location).output(
                             spatial_output_location, **out_kwargs
-                        ).run()
+                        ).run(cmd=_ff2_path)
                         silentremove(decrypted_track_location)
                     except Exception:
                         self.print(
@@ -1035,13 +1041,23 @@ class ModuleInterface:
                 "loglevel": "warning",
                 "audio_bitrate": f"{audio_track.bitrate}k",
             }
+            # Some ffmpeg builds mark the native 'opus' encoder experimental (its use
+            # aborts with "Default encoder for format opus ... is probably disabled").
+            # Force the stable libopus encoder explicitly when the output codec is OPUS.
+            if audio_track.codec is CodecEnum.OPUS:
+                ffcmd_out_kwargs.update({"codec": "libopus"})
             if self.settings["trim_track_by_sample_rate"]:
                 ffcmd_out_kwargs.update(
                     {"af": f"atrim=start_sample={int(int(audio_track.sample_rate) * 6.5)}"}
                 )
 
             ffcmd = ffcmd.output(**ffcmd_out_kwargs)
-            stdout, stderr = ffcmd.run()
+            # Use an ffmpeg that can actually encode Opus: prefer the app/bundled
+            # ffmpeg.exe (find_system_ffmpeg), but if it lacks an Opus encoder, fall
+            # back to the next working ffmpeg on PATH so previews never fail silently.
+            _pref = find_system_ffmpeg()[1]
+            _ff_path = resolve_ffmpeg_with_opus(preferred=_pref) or 'ffmpeg'
+            stdout, stderr = ffcmd.run(cmd=_ff_path)
             if stderr:
                 raise RuntimeError(f"ffmpeg: {stderr}")
             silentremove(decrypted_track_location)
@@ -1122,7 +1138,7 @@ class ModuleInterface:
             and download_info.temp_file_path
             and os.path.isfile(download_info.temp_file_path)
         ):
-            cache[cache_key] = download_info.temp_file_path
+            self._preview_audio_cache[cache_key] = download_info.temp_file_path
             return download_info.temp_file_path
         return None
 
