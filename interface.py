@@ -1016,9 +1016,8 @@ class ModuleInterface:
                         ).run(cmd=_ff2_path)
                         silentremove(decrypted_track_location)
                     except Exception:
-                        self.print(
-                            f"{module_information.service_name}: FFmpeg remux of Atmos "
-                            "audio failed, using decrypted file as-is."
+                        LOGGER.debug(
+                            "FFmpeg remux of Atmos audio failed, using decrypted file as-is."
                         )
                         spatial_output_location = decrypted_track_location
                 # MHA1/MHM1 (Sony 360RA MPEG-H 3D Audio): ffmpeg has no muxer for
